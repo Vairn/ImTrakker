@@ -269,6 +269,40 @@ static void draw_vu(const char* id, float level, float hold, ImVec4 col) {
     ImGui::PopID();
 }
 
+static std::string format_smus_event(const smus::SEvent& ev) {
+    char buf[24];
+    if (ev.sid < 0x80) {
+        static const char* kNames[12] = {"C-", "C#", "D-", "D#", "E-", "F-",
+                                         "F#", "G-", "G#", "A-", "A#", "B-"};
+        const int midi = ev.sid;
+        const int oct = midi / 12 - 1;
+        const bool chord = (ev.data & 0x80) != 0;
+        const bool tie = (ev.data & 0x40) != 0;
+        const int div = ev.data & 0x07;
+        std::snprintf(buf, sizeof(buf), "%s%d%s%s d%d", kNames[midi % 12], oct, chord ? "+" : " ",
+                      tie ? "~" : " ", div);
+        return buf;
+    }
+    if (ev.sid == 0x80) {
+        std::snprintf(buf, sizeof(buf), "--- RST d%d", ev.data & 0x07);
+        return buf;
+    }
+    if (ev.sid == 0x81) {
+        std::snprintf(buf, sizeof(buf), "INS %02d", int(ev.data));
+        return buf;
+    }
+    if (ev.sid == 0x84) {
+        std::snprintf(buf, sizeof(buf), "VOL %02d", int(ev.data));
+        return buf;
+    }
+    if (ev.sid == 0x88) {
+        std::snprintf(buf, sizeof(buf), "TMP %d", int(ev.data));
+        return buf;
+    }
+    std::snprintf(buf, sizeof(buf), "CTL %02X %02X", int(ev.sid), int(ev.data));
+    return buf;
+}
+
 int main(int argc, char** argv) {
     std::string song_arg;
     float dump_sec = -1.f;
@@ -442,6 +476,9 @@ int main(int argc, char** argv) {
             }
         } else if (app.smus) {
             ssnap = app.smus->snapshot();
+            if (ssnap.event_flash) {
+                app.flash = std::max(app.flash, 0.1f);
+            }
         }
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -493,23 +530,125 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Button("Restart")) {
                 app.smus->restart();
+                app.flash = 0.4f;
             }
             ImGui::SameLine();
             ImGui::Text("%s   %.1f BPM   %s", ssnap.title.c_str(), ssnap.bpm,
-                        ssnap.finished ? "END" : "PLAYING");
+                        ssnap.finished ? "END" : (ssnap.playing ? "PLAYING" : "PAUSED"));
+
+            {
+                float prog = 0.f;
+                int n = 0;
+                for (int ci = 0; ci < ssnap.tracks && ci < 4; ++ci) {
+                    if (ssnap.track_length[size_t(ci)] > 0) {
+                        prog += float(ssnap.track_index[size_t(ci)]) /
+                                float(ssnap.track_length[size_t(ci)]);
+                        ++n;
+                    }
+                }
+                ImGui::ProgressBar(n ? prog / float(n) : 0.f, ImVec2(-1, 10), "");
+            }
+
             ImGui::TextDisabled("Space  ·  R restart  ·  O open");
             ImGui::TextWrapped("%s", app.status.c_str());
-            if (ImGui::BeginTable("smus_ch", 4, ImGuiTableFlags_SizingStretchSame)) {
-                for (int ci = 0; ci < 4; ++ci) {
+
+            const int chn = std::max(1, std::min(4, ssnap.tracks));
+            if (ImGui::BeginTable("smus_chs", chn, ImGuiTableFlags_SizingStretchSame)) {
+                for (int ci = 0; ci < chn; ++ci) {
                     ImGui::TableNextColumn();
-                    ImGui::Text("AUD%d", ci);
-                    ImGui::TextDisabled("evt %d%s", ssnap.track_index[size_t(ci)],
+                    const auto& ch = ssnap.channels[size_t(ci)];
+                    ImGui::PushStyleColor(ImGuiCol_Text, ch_color(ci));
+                    ImGui::Text("AUD%d %s", ci, ch.active ? "" : "·");
+                    ImGui::PopStyleColor();
+                    ImGui::Text("%s", ch.last_note);
+                    ImGui::TextDisabled("%02d %s", ch.instrument_reg, ch.instrument_name);
+                    ImGui::TextDisabled("evt %d / %d%s", ssnap.track_index[size_t(ci)],
+                                        ssnap.track_length[size_t(ci)],
                                         ssnap.track_done[size_t(ci)] ? " done" : "");
-                    draw_vu("vu", std::min(1.f, ssnap.voice_peak[size_t(ci)] * 2.4f),
-                            std::min(1.f, ssnap.voice_peak[size_t(ci)] * 2.4f), ch_color(ci));
+                    draw_vu("vu", std::min(1.f, ch.peak * 2.4f), std::min(1.f, ch.peak_hold * 2.4f),
+                            ch_color(ci));
                 }
                 ImGui::EndTable();
             }
+
+            ImGui::Separator();
+            ImGui::Text("TRACKS");
+            const auto& score = app.smus->score();
+            int max_len = 1;
+            for (int ci = 0; ci < chn && ci < int(score.tracks.size()); ++ci) {
+                max_len = std::max(max_len, int(score.tracks[size_t(ci)].size()));
+            }
+            // Follow the furthest-ahead live cursor so the window stays useful.
+            int focus = 0;
+            for (int ci = 0; ci < chn; ++ci) {
+                focus = std::max(focus, ssnap.track_index[size_t(ci)]);
+            }
+            const int visible = std::min(app.zoom_rows, max_len);
+            const int start = std::clamp(focus - visible / 2, 0, std::max(0, max_len - visible));
+            if (ImGui::BeginTable("smus_pat", 1 + chn,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_ScrollY,
+                                  ImVec2(-1, 320))) {
+                ImGui::TableSetupColumn("EVT", ImGuiTableColumnFlags_WidthFixed, 40);
+                for (int c = 0; c < chn; ++c) {
+                    char hd[8];
+                    std::snprintf(hd, sizeof(hd), "AUD%d", c);
+                    ImGui::TableSetupColumn(hd);
+                }
+                ImGui::TableHeadersRow();
+                for (int vi = 0; vi < visible; ++vi) {
+                    const int row = start + vi;
+                    if (row >= max_len) {
+                        break;
+                    }
+                    ImGui::TableNextRow();
+                    bool any_cur = false;
+                    for (int c = 0; c < chn; ++c) {
+                        if (row == ssnap.track_index[size_t(c)]) {
+                            any_cur = true;
+                            break;
+                        }
+                    }
+                    if (any_cur) {
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                              IM_COL32(180 + int(app.flash * 70), 50, 25, 255));
+                    }
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%03d", row);
+                    for (int c = 0; c < chn; ++c) {
+                        ImGui::TableSetColumnIndex(c + 1);
+                        if (c >= int(score.tracks.size()) || row >= int(score.tracks[size_t(c)].size())) {
+                            ImGui::TextDisabled("...");
+                            continue;
+                        }
+                        const auto& ev = score.tracks[size_t(c)][size_t(row)];
+                        const std::string text = format_smus_event(ev);
+                        const bool cur = row == ssnap.track_index[size_t(c)];
+                        if (cur) {
+                            ImGui::TextUnformatted(text.c_str());
+                        } else {
+                            ImGui::TextColored(ch_color(c), "%s", text.c_str());
+                        }
+                    }
+                }
+                ImGui::EndTable();
+            }
+
+            ImGui::Separator();
+            ImGui::Text("INSTRUMENTS");
+            ImGui::BeginChild("smus_ins", ImVec2(0, 48), false, ImGuiWindowFlags_HorizontalScrollbar);
+            bool first = true;
+            for (const auto& [reg, name] : score.instruments) {
+                if (!first) {
+                    ImGui::SameLine();
+                }
+                first = false;
+                char lab[48];
+                std::snprintf(lab, sizeof(lab), "%02d:%s", reg, name.c_str());
+                ImGui::SmallButton(lab);
+            }
+            ImGui::EndChild();
+
             ImGui::End();
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);

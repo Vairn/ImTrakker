@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
-#include <mutex>
 
 namespace smus {
 namespace {
@@ -75,6 +75,7 @@ Engine::Engine(Score score, std::unordered_map<int, Instrument> instruments, int
     for (auto& tr : tracks_) {
         prime_track(tr);
     }
+    advance_tracks(0.f);
 }
 
 std::unique_ptr<Engine> Engine::load(const std::filesystem::path& path) {
@@ -98,6 +99,7 @@ void Engine::restart() {
     for (auto& v : voices_) {
         v = Voice{};
     }
+    ui_prev_index_ = {-1, -1, -1, -1};
     for (size_t i = 0; i < voices_.size(); ++i) {
         voices_[i].channel = int(i);
     }
@@ -113,6 +115,7 @@ void Engine::restart() {
         prime_track(tr);
     }
     playing_ = true;
+    advance_tracks(0.f);
 }
 
 bool Engine::finished() const {
@@ -167,7 +170,10 @@ void Engine::start_voice(int ch, int midi, int flags, TrackState& tr, bool tied)
     const Instrument& inst = inst_for_reg(tr.instrument_reg);
     const float dur_beats = note_duration_beats(flags);
     int note_samples = std::max(1, int(dur_beats * beat_samples_));
-    int gate_samples = tied ? note_samples : std::max(1, (note_samples * 0xC000) >> 16);
+    // Sonix MULU #$C000 / SWAP — must use 64-bit; 32-bit overflows on ≥ half notes.
+    int gate_samples =
+        tied ? note_samples
+             : std::max(1, int((std::int64_t(note_samples) * 0xC000) >> 16));
     const float freq = 440.f * std::pow(2.f, float(midi - 69) / 12.f);
 
     std::vector<float> sample_wave;
@@ -251,6 +257,14 @@ void Engine::start_voice(int ch, int midi, int flags, TrackState& tr, bool tied)
     v.note_freq = freq;
     v.in_hold = false;
     v.peak = 0.f;
+    v.midi = midi;
+    v.instrument_reg = tr.instrument_reg;
+    {
+        static const char* kNames[12] = {"C-", "C#", "D-", "D#", "E-", "F-",
+                                         "F#", "G-", "G#", "A-", "A#", "B-"};
+        const int oct = midi / 12 - 1;
+        std::snprintf(v.last_note, sizeof(v.last_note), "%s%d", kNames[midi % 12], oct);
+    }
 }
 
 void Engine::consume_event(TrackState& tr, int ch) {
@@ -315,6 +329,95 @@ void Engine::advance_tracks(float beats) {
     }
 }
 
+void Engine::step_envelope(Voice& v, const Instrument& inst, float* env_out, float* bank_out, int n) {
+    const float sr = float(sr_);
+    float levels[4];
+    for (int i = 0; i < 4; ++i) {
+        levels[i] = float(inst.env_levels[size_t(i)]);
+    }
+    float rates[4];
+    for (int i = 0; i < 4; ++i) {
+        const float units = sonix_rate_units(inst.env_rates[size_t(i)]);
+        const float secs = std::max(0.008f, units / 2500.f);
+        rates[i] = 255.f / (secs * sr);
+    }
+
+    float env_level = v.env_fixed;
+    int stage = v.env_stage;
+    float lfo = v.lfo_phase;
+    bool frozen = v.lfo_frozen;
+    float mod_held = v.lfo_mod;
+    int gate_left = v.samples_left;
+
+    const int lfo_speed = inst.lfo_rate ? inst.lfo_rate : inst.lfo_inc;
+    const bool use_lfo = (inst.lfo_enable || inst.f_mod || inst.vol_mod || inst.pitch_mod) &&
+                         lfo_speed > 0 && !inst.mod_table.empty();
+    float lfo_step = 0.f;
+    if (use_lfo) {
+        const float lfo_hz =
+            inst.lfo_oneshot ? (0.35f + (lfo_speed / 255.f) * 5.f) : (0.15f + (lfo_speed / 255.f) * 1.2f);
+        lfo_step = (lfo_hz * 256.f) / sr;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if (gate_left <= 0 && stage < 3) {
+            stage = 3;
+            v.release = true;
+        }
+        float target = levels[std::min(stage, 3)];
+        if (stage >= 3) {
+            target = 0.f;
+        }
+        float spd = rates[std::min(stage, 3)];
+        if (stage >= 3 && spd < 1e-6f) {
+            spd = 255.f / (0.05f * sr);
+        }
+        const float dist = std::fabs(env_level - target);
+        if (dist <= spd) {
+            env_level = target;
+            if (stage < 2) {
+                ++stage;
+            }
+        } else if (env_level < target) {
+            env_level += spd;
+        } else {
+            env_level -= spd;
+        }
+
+        float mod = mod_held;
+        if (use_lfo && !frozen) {
+            mod = inst.mod_table[size_t(int(lfo) & 255)] * 128.f;
+            lfo += lfo_step;
+            if (inst.lfo_oneshot && lfo >= 254.f) {
+                lfo = 254.f;
+                frozen = true;
+                mod = inst.mod_table[254] * 128.f;
+            } else if (!inst.lfo_oneshot && lfo >= 256.f) {
+                lfo -= 256.f;
+            }
+            mod_held = mod;
+        }
+
+        const int env_i = std::clamp(int(env_level), 0, 255);
+        env_out[i] = float(env_i) / 255.f;
+        if (bank_out) {
+            int filt =
+                (255 - inst.f_base) - ((env_i * inst.f_env) >> 8) + int((mod * inst.f_mod) / 256.f);
+            filt = std::clamp(filt, 0, 255);
+            bank_out[i] = float(filt >> 2);
+        }
+        if (gate_left > 0) {
+            --gate_left;
+        }
+    }
+    v.env_fixed = env_level;
+    v.env_stage = stage;
+    v.lfo_phase = lfo;
+    v.lfo_frozen = frozen;
+    v.lfo_mod = mod_held;
+    v.samples_left = gate_left;
+}
+
 void Engine::render_voice(Voice& v, float* mono, int n) {
     std::fill(mono, mono + n, 0.f);
     if (!v.active || !v.instrument) {
@@ -323,116 +426,27 @@ void Engine::render_voice(Voice& v, float* mono, int n) {
     const Instrument& inst = *v.instrument;
     const float sr = float(sr_);
 
-    auto env_step = [&](float* env_out, float* bank_out) {
-        float levels[4];
-        for (int i = 0; i < 4; ++i) {
-            levels[i] = float(inst.env_levels[size_t(i)]);
-        }
-        auto step_per = [&](int rate_word) {
-            const float units = sonix_rate_units(rate_word);
-            const float secs = std::max(0.008f, units / 2500.f);
-            return 255.f / (secs * sr);
-        };
-        float rates[4];
-        for (int i = 0; i < 4; ++i) {
-            rates[i] = step_per(inst.env_rates[size_t(i)]);
-        }
-
-        float env = v.env_fixed;
-        int stage = v.env_stage;
-        float lfo = v.lfo_phase;
-        bool frozen = v.lfo_frozen;
-        float mod_held = v.lfo_mod;
-        int gate_left = v.samples_left;
-
-        const int lfo_speed = inst.lfo_rate ? inst.lfo_rate : inst.lfo_inc;
-        const bool use_lfo =
-            (inst.lfo_enable || inst.f_mod || inst.vol_mod || inst.pitch_mod) && lfo_speed > 0 &&
-            !inst.mod_table.empty();
-        float lfo_step = 0.f;
-        if (use_lfo) {
-            const float lfo_hz =
-                inst.lfo_oneshot ? (0.35f + (lfo_speed / 255.f) * 5.f) : (0.15f + (lfo_speed / 255.f) * 1.2f);
-            lfo_step = (lfo_hz * 256.f) / sr;
-        }
-
-        for (int i = 0; i < n; ++i) {
-            if (gate_left <= 0 && stage < 3) {
-                stage = 3;
-                v.release = true;
-            }
-            float target = levels[std::min(stage, 3)];
-            if (stage >= 3) {
-                target = 0.f;
-            }
-            float spd = rates[std::min(stage, 3)];
-            if (stage >= 3 && spd < 1e-6f) {
-                spd = 255.f / (0.05f * sr);
-            }
-            const float dist = std::fabs(env - target);
-            if (dist <= spd) {
-                env = target;
-                if (stage < 2) {
-                    ++stage;
-                }
-            } else if (env < target) {
-                env += spd;
-            } else {
-                env -= spd;
-            }
-
-            float mod = mod_held;
-            if (use_lfo && !frozen) {
-                mod = inst.mod_table[size_t(int(lfo) & 255)] * 128.f;
-                lfo += lfo_step;
-                if (inst.lfo_oneshot && lfo >= 254.f) {
-                    lfo = 254.f;
-                    frozen = true;
-                    mod = inst.mod_table[254] * 128.f;
-                } else if (!inst.lfo_oneshot && lfo >= 256.f) {
-                    lfo -= 256.f;
-                }
-                mod_held = mod;
-            }
-
-            const int env_i = std::clamp(int(env), 0, 255);
-            env_out[i] = float(env_i) / 255.f;
-            if (bank_out) {
-                int filt = (255 - inst.f_base) - ((env_i * inst.f_env) >> 8) + int((mod * inst.f_mod) / 256.f);
-                filt = std::clamp(filt, 0, 255);
-                bank_out[i] = float(filt >> 2);
-            }
-            if (gate_left > 0) {
-                --gate_left;
-            }
-        }
-        v.env_fixed = env;
-        v.env_stage = stage;
-        v.lfo_phase = lfo;
-        v.lfo_frozen = frozen;
-        v.lfo_mod = mod_held;
-        v.samples_left = gate_left;
-    };
-
     if (inst.kind == InstrKind::Synth && inst.filter_banks.size() >= 64 * 128) {
-        std::vector<float> env(size_t(n)), bank(size_t(n));
-        env_step(env.data(), bank.data());
+        std::vector<float> env_buf(static_cast<size_t>(n));
+        std::vector<float> bank_buf(static_cast<size_t>(n));
+        step_envelope(v, inst, env_buf.data(), bank_buf.data(), n);
         float peak = 0.f;
         for (int i = 0; i < n; ++i) {
-            const double pos = v.pos + v.step * i;
-            const int idx = int(std::floor(pos)) & 127;
-            const int b0 = std::clamp(int(bank[size_t(i)]), 0, 63);
+            const double phase = v.pos + v.step * i;
+            const int idx = int(std::floor(phase)) & 127;
+            const int b0 = std::clamp(int(bank_buf[size_t(i)]), 0, 63);
             const int b1 = std::min(63, b0 + 1);
-            const float frac = bank[size_t(i)] - float(b0);
+            const float frac = bank_buf[size_t(i)] - float(b0);
             const float s0 = inst.filter_banks[size_t(b0 * 128 + idx)];
             const float s1 = inst.filter_banks[size_t(b1 * 128 + idx)];
             const float sample = s0 * (1.f - frac) + s1 * frac;
-            const float amp = inst.vol_env ? env[size_t(i)] : 1.f;
+            const float amp = inst.vol_env ? env_buf[size_t(i)] : 1.f;
             mono[i] = sample * amp * v.vol * 1.4f;
             peak = std::max(peak, std::fabs(mono[i]));
         }
         v.pos += v.step * n;
-        v.peak = std::max(peak, v.peak * 0.9f);
+        v.peak = peak;
+        v.peak_hold = std::max(peak, v.peak_hold * 0.995f);
         if (v.env_fixed <= 1.f &&
             (v.env_stage >= 3 || inst.env_levels[size_t(std::min(v.env_stage, 3))] == 0)) {
             v.active = false;
@@ -449,11 +463,11 @@ void Engine::render_voice(Voice& v, float* mono, int n) {
         v.active = false;
         return;
     }
-    std::vector<float> env(size_t(n));
-    env_step(env.data(), nullptr);
+    std::vector<float> env_buf(static_cast<size_t>(n));
+    step_envelope(v, inst, env_buf.data(), nullptr, n);
 
     float peak = 0.f;
-    double pos = v.pos;
+    double phase = v.pos;
     for (int i = 0; i < n; ++i) {
         double step = v.step;
         if (inst.vib_depth > 0 && inst.vib_rate > 0) {
@@ -470,17 +484,17 @@ void Engine::render_voice(Voice& v, float* mono, int n) {
         float sample = 0.f;
         if (le > ls) {
             double idx_f;
-            if (pos < le) {
-                idx_f = std::min(pos, double(wlen) - 1.001);
+            if (phase < le) {
+                idx_f = std::min(phase, double(wlen) - 1.001);
             } else {
                 const double ll = double(le - ls);
-                idx_f = ls + std::fmod(pos - ls, ll);
+                idx_f = ls + std::fmod(phase - ls, ll);
                 v.in_hold = true;
             }
             int i0 = int(std::floor(idx_f));
             float frac = float(idx_f - i0);
             int i1 = i0 + 1;
-            if (pos >= le) {
+            if (phase >= le) {
                 if (i1 >= le) {
                     i1 = ls;
                 }
@@ -491,23 +505,24 @@ void Engine::render_voice(Voice& v, float* mono, int n) {
             }
             sample = wave[size_t(i0)] * (1.f - frac) + wave[size_t(i1)] * frac;
         } else {
-            if (pos >= wlen) {
+            if (phase >= wlen) {
                 v.active = false;
                 break;
             }
-            const int idx = std::clamp(int(pos), 0, wlen - 1);
+            const int idx = std::clamp(int(phase), 0, wlen - 1);
             sample = wave[size_t(idx)];
         }
-        mono[i] = sample * env[size_t(i)] * v.vol;
+        mono[i] = sample * env_buf[size_t(i)] * v.vol;
         peak = std::max(peak, std::fabs(mono[i]));
-        pos += step;
+        phase += step;
     }
-    if (le > ls && pos >= le) {
-        v.pos = ls + std::fmod(pos - ls, double(le - ls));
+    if (le > ls && phase >= le) {
+        v.pos = ls + std::fmod(phase - ls, double(le - ls));
     } else {
-        v.pos = pos;
+        v.pos = phase;
     }
-    v.peak = std::max(peak, v.peak * 0.9f);
+    v.peak = peak;
+    v.peak_hold = std::max(peak, v.peak_hold * 0.995f);
     if (le <= ls && v.pos >= wlen) {
         v.active = false;
     } else if (v.env_fixed <= 1.f &&
@@ -522,21 +537,21 @@ void Engine::render(float* interleaved_stereo, int n_frames) {
         return;
     }
     const int grain = 128;
-    int pos = 0;
-    std::vector<float> mono(size_t(grain));
-    while (pos < n_frames) {
-        const int g = std::min(grain, n_frames - pos);
+    int frame = 0;
+    std::vector<float> mono(static_cast<size_t>(grain));
+    while (frame < n_frames) {
+        const int g = std::min(grain, n_frames - frame);
         advance_tracks(float(g) / beat_samples_);
         for (auto& v : voices_) {
             if (v.active && v.instrument) {
                 render_voice(v, mono.data(), g);
                 const int side = kChannelPan[v.channel & 3];
                 for (int i = 0; i < g; ++i) {
-                    interleaved_stereo[(pos + i) * 2 + side] += mono[size_t(i)];
+                    interleaved_stereo[(frame + i) * 2 + side] += mono[size_t(i)];
                 }
             }
         }
-        pos += g;
+        frame += g;
     }
     for (int i = 0; i < n_frames * 2; ++i) {
         interleaved_stereo[i] = std::clamp(interleaved_stereo[i] * master_, -1.f, 1.f);
@@ -553,9 +568,32 @@ Engine::Snapshot Engine::snapshot() const {
     for (size_t i = 0; i < 4; ++i) {
         if (i < tracks_.size()) {
             s.track_index[i] = tracks_[i].index;
+            s.track_length[i] = int(tracks_[i].events.size());
             s.track_done[i] = tracks_[i].done;
+            if (tracks_[i].index != ui_prev_index_[i]) {
+                s.event_flash = true;
+                ui_prev_index_[i] = tracks_[i].index;
+            }
         }
-        s.voice_peak[i] = voices_[i].peak;
+        const Voice& v = voices_[i];
+        ChannelSnap& ch = s.channels[i];
+        ch.active = v.active;
+        ch.midi = v.midi;
+        ch.instrument_reg = v.instrument_reg;
+        std::snprintf(ch.last_note, sizeof(ch.last_note), "%s", v.last_note);
+        ch.peak = v.peak;
+        ch.peak_hold = v.peak_hold;
+        ch.env = v.env_fixed / 255.f;
+        const char* iname = "—";
+        if (v.instrument && !v.instrument->name.empty()) {
+            iname = v.instrument->name.c_str();
+        } else {
+            auto it = score_.instruments.find(v.instrument_reg);
+            if (it != score_.instruments.end()) {
+                iname = it->second.c_str();
+            }
+        }
+        std::snprintf(ch.instrument_name, sizeof(ch.instrument_name), "%.23s", iname);
     }
     return s;
 }

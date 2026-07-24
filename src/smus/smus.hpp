@@ -85,6 +85,16 @@ public:
     int sample_rate() const { return sr_; }
 
     // UI-ish snapshot
+    struct ChannelSnap {
+        bool active = false;
+        int midi = 0;
+        int instrument_reg = 0;
+        char last_note[8]{"---"};
+        char instrument_name[24]{"—"};
+        float peak = 0.f;
+        float peak_hold = 0.f;
+        float env = 0.f;
+    };
     struct Snapshot {
         std::string title;
         float bpm = 120.f;
@@ -92,8 +102,10 @@ public:
         bool finished = false;
         int tracks = 0;
         std::array<int, 4> track_index{};
+        std::array<int, 4> track_length{};
         std::array<bool, 4> track_done{};
-        std::array<float, 4> voice_peak{};
+        std::array<ChannelSnap, 4> channels{};
+        bool event_flash = false;
     };
     Snapshot snapshot() const;
 
@@ -120,6 +132,10 @@ private:
         float note_freq = 440.f;
         bool in_hold = false;
         float peak = 0.f;
+        float peak_hold = 0.f;
+        int midi = 0;
+        int instrument_reg = 0;
+        char last_note[8]{"---"};
     };
 
     struct TrackState {
@@ -132,11 +148,14 @@ private:
         bool done = false;
     };
 
+    mutable std::array<int, 4> ui_prev_index_{-1, -1, -1, -1};
+
     void prime_track(TrackState& tr);
     void handle_control(TrackState& tr, const SEvent& ev);
     void start_voice(int ch, int midi, int flags, TrackState& tr, bool tied);
     void consume_event(TrackState& tr, int ch);
     void advance_tracks(float beats);
+    void step_envelope(Voice& v, const Instrument& inst, float* env_out, float* bank_out, int n);
     void render_voice(Voice& v, float* mono, int n);
     const Instrument& inst_for_reg(int reg) const;
 

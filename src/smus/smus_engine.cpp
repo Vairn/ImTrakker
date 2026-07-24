@@ -57,6 +57,7 @@ const float kNotePeriod[12] = {
 Engine::Engine(Score score, std::unordered_map<int, Instrument> instruments, int sample_rate,
                float master)
     : score_(std::move(score)),
+      pattern_(bake_display_pattern(score_)),
       instruments_(std::move(instruments)),
       sr_(sample_rate),
       master_(master),
@@ -99,7 +100,6 @@ void Engine::restart() {
     for (auto& v : voices_) {
         v = Voice{};
     }
-    ui_prev_index_ = {-1, -1, -1, -1};
     for (size_t i = 0; i < voices_.size(); ++i) {
         voices_[i].channel = int(i);
     }
@@ -111,6 +111,8 @@ void Engine::restart() {
     }
     bpm_ = std::max(score_.tempo / 128.f, 1.f);
     beat_samples_ = (60.f / bpm_) * float(sr_);
+    beats_played_ = 0.f;
+    last_playhead_row_ = -1;
     for (auto& tr : tracks_) {
         prime_track(tr);
     }
@@ -314,6 +316,9 @@ void Engine::consume_event(TrackState& tr, int ch) {
 }
 
 void Engine::advance_tracks(float beats) {
+    if (beats > 0.f) {
+        beats_played_ += beats;
+    }
     for (size_t ch = 0; ch < tracks_.size(); ++ch) {
         auto& tr = tracks_[ch];
         if (tr.done) {
@@ -565,15 +570,17 @@ Engine::Snapshot Engine::snapshot() const {
     s.playing = playing_;
     s.finished = finished();
     s.tracks = int(tracks_.size());
+    s.playhead_row = playhead_row();
+    s.pattern_rows = pattern_.rows;
+    if (s.playhead_row != last_playhead_row_) {
+        s.event_flash = true;
+        last_playhead_row_ = s.playhead_row;
+    }
     for (size_t i = 0; i < 4; ++i) {
         if (i < tracks_.size()) {
             s.track_index[i] = tracks_[i].index;
             s.track_length[i] = int(tracks_[i].events.size());
             s.track_done[i] = tracks_[i].done;
-            if (tracks_[i].index != ui_prev_index_[i]) {
-                s.event_flash = true;
-                ui_prev_index_[i] = tracks_[i].index;
-            }
         }
         const Voice& v = voices_[i];
         ChannelSnap& ch = s.channels[i];

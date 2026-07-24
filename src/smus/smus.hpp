@@ -67,6 +67,24 @@ Score parse_file(const std::filesystem::path& path);
 Instrument load_instrument(const std::filesystem::path& folder, const std::string& name);
 Instrument default_instrument(const std::string& name = "default");
 
+// Display-only pattern cell (tracker-style row/channel grid).
+struct PatternCell {
+    int midi = 0;          // 0 = empty / no note
+    int instrument = -1;   // register, -1 = none shown
+    int volume = -1;       // 0..64-ish, -1 = none
+    bool rest = false;
+    char text[20]{"--- .. ..."};
+};
+
+struct DisplayPattern {
+    int channels = 0;
+    int rows = 0;
+    // cells[row][ch]
+    std::vector<std::vector<PatternCell>> cells;
+};
+
+DisplayPattern bake_display_pattern(const Score& score);
+
 class Engine {
 public:
     static std::unique_ptr<Engine> load(const std::filesystem::path& path);
@@ -81,8 +99,11 @@ public:
     bool finished() const;
 
     const Score& score() const { return score_; }
+    const DisplayPattern& display_pattern() const { return pattern_; }
     float bpm() const { return bpm_; }
     int sample_rate() const { return sr_; }
+    float beats_played() const { return beats_played_; }
+    int playhead_row() const { return int(beats_played_ * 8.f); }
 
     // UI-ish snapshot
     struct ChannelSnap {
@@ -101,6 +122,8 @@ public:
         bool playing = false;
         bool finished = false;
         int tracks = 0;
+        int playhead_row = 0;
+        int pattern_rows = 0;
         std::array<int, 4> track_index{};
         std::array<int, 4> track_length{};
         std::array<bool, 4> track_done{};
@@ -148,7 +171,7 @@ private:
         bool done = false;
     };
 
-    mutable std::array<int, 4> ui_prev_index_{-1, -1, -1, -1};
+    mutable int last_playhead_row_ = -1;
 
     void prime_track(TrackState& tr);
     void handle_control(TrackState& tr, const SEvent& ev);
@@ -160,12 +183,14 @@ private:
     const Instrument& inst_for_reg(int reg) const;
 
     Score score_;
+    DisplayPattern pattern_;
     std::unordered_map<int, Instrument> instruments_;
     int sr_ = 44100;
     float master_ = 0.28f;
     float bpm_ = 120.f;
     float beat_samples_ = 0.f;
     float score_volume_ = 1.f;
+    float beats_played_ = 0.f;
     std::vector<TrackState> tracks_;
     std::array<Voice, 4> voices_{};
     bool playing_ = true;

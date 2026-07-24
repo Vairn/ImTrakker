@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -335,7 +336,131 @@ Instrument load_sampled_instr(const std::filesystem::path& instr_path, const std
                    vib_delay);
 }
 
+int duration_rows(uint8_t data_byte) {
+    const int n_tuplet = (data_byte >> 4) & 3;
+    const bool dotted = (data_byte & 0x08) != 0;
+    const int division = data_byte & 7;
+    // 32nd note = 1 row (same mapping as the earlier SMUS→pattern bake)
+    int rows = 1 << std::max(0, 5 - division);
+    if (dotted) {
+        rows = rows * 3 / 2;
+    }
+    if (n_tuplet) {
+        const int order = 2 * n_tuplet + 1;
+        rows = std::max(1, rows * 2 / order);
+    }
+    return std::max(1, rows);
+}
+
+void format_cell(PatternCell& cell) {
+    static const char* kNames[12] = {"C-", "C#", "D-", "D#", "E-", "F-",
+                                     "F#", "G-", "G#", "A-", "A#", "B-"};
+    if (cell.rest) {
+        std::snprintf(cell.text, sizeof(cell.text), "--- .. ...");
+        return;
+    }
+    if (cell.midi <= 0) {
+        std::snprintf(cell.text, sizeof(cell.text), "--- .. ...");
+        return;
+    }
+    const int oct = cell.midi / 12 - 1;
+    char note[8];
+    std::snprintf(note, sizeof(note), "%s%d", kNames[cell.midi % 12], oct);
+    if (cell.instrument >= 0) {
+        if (cell.volume >= 0) {
+            std::snprintf(cell.text, sizeof(cell.text), "%s %02X C%02X", note, cell.instrument,
+                          cell.volume);
+        } else {
+            std::snprintf(cell.text, sizeof(cell.text), "%s %02X ...", note, cell.instrument);
+        }
+    } else if (cell.volume >= 0) {
+        std::snprintf(cell.text, sizeof(cell.text), "%s .. C%02X", note, cell.volume);
+    } else {
+        std::snprintf(cell.text, sizeof(cell.text), "%s .. ...", note);
+    }
+}
+
 }  // namespace
+
+DisplayPattern bake_display_pattern(const Score& score) {
+    DisplayPattern pat;
+    pat.channels = std::min(4, int(score.tracks.size()));
+    if (pat.channels <= 0) {
+        return pat;
+    }
+
+    struct Ev {
+        int row = 0;
+        int midi = 0;
+        int instrument = 0;
+        int vol = -1;
+        bool rest = false;
+    };
+    std::vector<std::vector<Ev>> placed(size_t(pat.channels));
+    int max_row = 1;
+
+    for (int ti = 0; ti < pat.channels; ++ti) {
+        const auto& trak = score.tracks[size_t(ti)];
+        int cursor = 0;
+        int cur_ins = 0;
+        int cur_vol = -1;
+        if (!score.instruments.empty()) {
+            cur_ins = score.instruments.begin()->first;
+            auto it = score.instruments.find(ti);
+            if (it != score.instruments.end()) {
+                cur_ins = it->first;
+            }
+        }
+
+        for (size_t i = 0; i < trak.size(); ++i) {
+            const SEvent& ev = trak[i];
+            if (ev.sid < 0x80) {
+                const bool chord = (ev.data & 0x80) != 0;
+                const int dur = duration_rows(ev.data);
+                if (!chord) {
+                    Ev e;
+                    e.row = cursor;
+                    e.midi = ev.sid;
+                    e.instrument = cur_ins;
+                    e.vol = cur_vol;
+                    placed[size_t(ti)].push_back(e);
+                }
+                cursor += dur;
+            } else if (ev.sid == 0x80) {
+                cursor += duration_rows(ev.data);
+            } else if (ev.sid == 0x81) {
+                cur_ins = ev.data;
+            } else if (ev.sid == 0x84) {
+                cur_vol = std::clamp(int(ev.data) * 64 / 127, 1, 64);
+            }
+        }
+        max_row = std::max(max_row, cursor);
+    }
+
+    max_row = std::clamp(max_row, 1, 8192);
+    pat.rows = max_row;
+    pat.cells.resize(size_t(max_row));
+    for (int r = 0; r < max_row; ++r) {
+        pat.cells[size_t(r)].assign(size_t(pat.channels), PatternCell{});
+        for (auto& cell : pat.cells[size_t(r)]) {
+            format_cell(cell);
+        }
+    }
+    for (int ti = 0; ti < pat.channels; ++ti) {
+        for (const Ev& e : placed[size_t(ti)]) {
+            if (e.row < 0 || e.row >= max_row) {
+                continue;
+            }
+            PatternCell& cell = pat.cells[size_t(e.row)][size_t(ti)];
+            cell.midi = e.midi;
+            cell.instrument = e.instrument;
+            cell.volume = e.vol;
+            cell.rest = e.rest;
+            format_cell(cell);
+        }
+    }
+    return pat;
+}
 
 bool is_smus_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);

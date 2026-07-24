@@ -1494,16 +1494,8 @@ int main(int argc, char** argv) {
                         ssnap.finished ? "END" : (ssnap.playing ? "PLAYING" : "PAUSED"));
 
             {
-                float prog = 0.f;
-                int n = 0;
-                for (int ci = 0; ci < ssnap.tracks && ci < 4; ++ci) {
-                    if (ssnap.track_length[size_t(ci)] > 0) {
-                        prog += float(ssnap.track_index[size_t(ci)]) /
-                                float(ssnap.track_length[size_t(ci)]);
-                        ++n;
-                    }
-                }
-                ImGui::ProgressBar(n ? prog / float(n) : 0.f, ImVec2(-1, 10), "");
+                const float total = float(std::max(1, ssnap.pattern_rows));
+                ImGui::ProgressBar(float(ssnap.playhead_row) / total, ImVec2(-1, 10), "");
             }
 
             ImGui::TextDisabled("Space  ·  R restart  ·  O open  ·  H help  ·  P options");
@@ -1520,8 +1512,7 @@ int main(int argc, char** argv) {
                     ImGui::PopStyleColor();
                     ImGui::Text("%s", ch.last_note);
                     ImGui::TextDisabled("%02d %s", ch.instrument_reg, ch.instrument_name);
-                    ImGui::TextDisabled("evt %d / %d%s", ssnap.track_index[size_t(ci)],
-                                        ssnap.track_length[size_t(ci)],
+                    ImGui::TextDisabled("row %d / %d%s", ssnap.playhead_row, ssnap.pattern_rows,
                                         ssnap.track_done[size_t(ci)] ? " done" : "");
                     if (app.view.show_vu) {
                         draw_vu("vu", std::min(1.f, ch.peak * 2.4f),
@@ -1533,24 +1524,17 @@ int main(int argc, char** argv) {
             }
 
             ImGui::Separator();
-            ImGui::Text("TRACKS");
-            const auto& score = app.smus->score();
-            int max_len = 1;
-            for (int ci = 0; ci < chn && ci < int(score.tracks.size()); ++ci) {
-                max_len = std::max(max_len, int(score.tracks[size_t(ci)].size()));
-            }
-            // Follow the furthest-ahead live cursor so the window stays useful.
-            int focus = 0;
-            for (int ci = 0; ci < chn; ++ci) {
-                focus = std::max(focus, ssnap.track_index[size_t(ci)]);
-            }
-            const int visible = std::min(app.zoom_rows, max_len);
-            const int start = std::clamp(focus - visible / 2, 0, std::max(0, max_len - visible));
+            ImGui::Text("PATTERN");
+            const auto& pat = app.smus->display_pattern();
+            const int pat_rows = pat.rows;
+            const int visible = std::min(app.zoom_rows, std::max(1, pat_rows));
+            const int start = std::clamp(ssnap.playhead_row - visible / 2, 0,
+                                         std::max(0, pat_rows - visible));
             if (ImGui::BeginTable("smus_pat", 1 + chn,
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                       ImGuiTableFlags_ScrollY,
                                   ImVec2(-1, 320))) {
-                ImGui::TableSetupColumn("EVT", ImGuiTableColumnFlags_WidthFixed, 40);
+                ImGui::TableSetupColumn("ROW", ImGuiTableColumnFlags_WidthFixed, 40);
                 for (int c = 0; c < chn; ++c) {
                     char hd[8];
                     std::snprintf(hd, sizeof(hd), "AUD%d", c);
@@ -1559,36 +1543,28 @@ int main(int argc, char** argv) {
                 ImGui::TableHeadersRow();
                 for (int vi = 0; vi < visible; ++vi) {
                     const int row = start + vi;
-                    if (row >= max_len) {
+                    if (row >= pat_rows) {
                         break;
                     }
                     ImGui::TableNextRow();
-                    bool any_cur = false;
-                    for (int c = 0; c < chn; ++c) {
-                        if (row == ssnap.track_index[size_t(c)]) {
-                            any_cur = true;
-                            break;
-                        }
-                    }
-                    if (any_cur) {
+                    const bool cur = row == ssnap.playhead_row;
+                    if (cur) {
                         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                               IM_COL32(180 + int(app.flash * 70), 50, 25, 255));
                     }
                     ImGui::TableSetColumnIndex(0);
                     ImGui::Text("%03d", row);
-                    for (int c = 0; c < chn; ++c) {
-                        ImGui::TableSetColumnIndex(c + 1);
-                        if (c >= int(score.tracks.size()) || row >= int(score.tracks[size_t(c)].size())) {
-                            ImGui::TextDisabled("...");
-                            continue;
-                        }
-                        const auto& ev = score.tracks[size_t(c)][size_t(row)];
-                        const std::string text = format_smus_event(ev);
-                        const bool cur = row == ssnap.track_index[size_t(c)];
-                        if (cur) {
-                            ImGui::TextUnformatted(text.c_str());
-                        } else {
-                            ImGui::TextColored(ch_color(c), "%s", text.c_str());
+                    if (row < int(pat.cells.size())) {
+                        for (int c = 0; c < chn && c < int(pat.cells[size_t(row)].size()); ++c) {
+                            ImGui::TableSetColumnIndex(c + 1);
+                            const auto& cell = pat.cells[size_t(row)][size_t(c)];
+                            if (cur) {
+                                ImGui::TextUnformatted(cell.text);
+                            } else if (cell.midi > 0) {
+                                ImGui::TextColored(ch_color(c), "%s", cell.text);
+                            } else {
+                                ImGui::TextDisabled("%s", cell.text);
+                            }
                         }
                     }
                 }
@@ -1599,7 +1575,7 @@ int main(int argc, char** argv) {
             ImGui::Text("INSTRUMENTS");
             ImGui::BeginChild("smus_ins", ImVec2(0, 48), false, ImGuiWindowFlags_HorizontalScrollbar);
             bool first = true;
-            for (const auto& [reg, name] : score.instruments) {
+            for (const auto& [reg, name] : app.smus->score().instruments) {
                 if (!first) {
                     ImGui::SameLine();
                 }

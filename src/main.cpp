@@ -1,6 +1,10 @@
-#include "hsq.hpp"
 #include "mod/module.hpp"
 #include "mod/player.hpp"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "portable-file-dialogs.h"
 
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
@@ -21,25 +25,8 @@
 
 namespace fs = std::filesystem;
 
-struct SongSlot {
-    const char* key;
-    const char* label;
-    const char* file;
-};
-
-static const SongSlot kDuneSongs[] = {
-    {"m1", "WORMSIGN", "m1.hsq"},
-    {"m2", "ECOLOVE", "m2.hsq"},
-    {"m3", "FREMENS", "m3.hsq"},
-};
-
 static fs::path find_data_dir() {
     if (const char* env = std::getenv("IMTRAKKER_DATA")) {
-        if (*env) {
-            return env;
-        }
-    }
-    if (const char* env = std::getenv("DUNE_DATA")) {
         if (*env) {
             return env;
         }
@@ -48,18 +35,10 @@ static fs::path find_data_dir() {
         IMTRAKKER_DEFAULT_DATA_DIR,
         "data",
         "../data",
-        "../Amiga/Dune/ripped",
-        "../../Amiga/Dune/ripped",
-        "../Dune/ripped",
-        "ripped",
-        "../ripped",
     };
     for (const char* c : candidates) {
         const fs::path p = c;
-        if (!fs::is_directory(p)) {
-            continue;
-        }
-        if (!fs::is_empty(p)) {
+        if (fs::is_directory(p)) {
             return p;
         }
     }
@@ -67,9 +46,6 @@ static fs::path find_data_dir() {
 }
 
 static fs::path resolve_song(const fs::path& data, const std::string& arg) {
-    if (arg == "m1" || arg == "m2" || arg == "m3") {
-        return data / (arg + ".hsq");
-    }
     fs::path p = arg;
     if (fs::is_regular_file(p)) {
         return p;
@@ -79,16 +55,16 @@ static fs::path resolve_song(const fs::path& data, const std::string& arg) {
         return p;
     }
     if (arg.find('.') == std::string::npos) {
-        p = data / (arg + ".hsq");
-        if (fs::is_regular_file(p)) {
-            return p;
-        }
         p = data / (arg + ".mod");
         if (fs::is_regular_file(p)) {
             return p;
         }
+        p = data / (arg + ".hsq");
+        if (fs::is_regular_file(p)) {
+            return p;
+        }
     }
-    return data / arg;
+    return fs::path(arg);
 }
 
 static void apply_style() {
@@ -125,11 +101,12 @@ static void apply_style() {
 struct App {
     fs::path data_dir;
     std::unique_ptr<mod::Player> player;
-    std::string song_key = "m1";
-    std::string status;
+    std::string status = "Open a module to begin";
     char open_path[512]{};
     int zoom_rows = 14;
     float flash = 0.f;
+    std::shared_ptr<pfd::open_file> pending_open;
+    std::string pending_load;
 
     bool load_path(const fs::path& path) {
         try {
@@ -141,6 +118,8 @@ struct App {
             }
             status = path.string() + "  (" + player->module().magic + ", " +
                      std::to_string(player->module().channels) + "ch)";
+            std::strncpy(open_path, path.string().c_str(), sizeof(open_path) - 1);
+            open_path[sizeof(open_path) - 1] = '\0';
             flash = 0.5f;
             return true;
         } catch (const std::exception& e) {
@@ -149,9 +128,20 @@ struct App {
         }
     }
 
-    bool load_dune(const char* key) {
-        song_key = key;
-        return load_path(resolve_song(data_dir, key));
+    void begin_browse() {
+        if (pending_open) {
+            return;
+        }
+        const std::string start = open_path[0] ? open_path : ".";
+        pending_open = std::make_shared<pfd::open_file>(
+            "Open module", start,
+            std::vector<std::string>{"Tracker modules", "*.mod *.hsq", "All files", "*.*"});
+    }
+
+    void request_open_typed() {
+        if (open_path[0]) {
+            pending_load = resolve_song(data_dir, open_path).string();
+        }
     }
 };
 
@@ -253,7 +243,7 @@ static void draw_vu(const char* id, float level, float hold, ImVec4 col) {
 }
 
 int main(int argc, char** argv) {
-    std::string song_arg = "m1";
+    std::string song_arg;
     float dump_sec = -1.f;
     fs::path dump_path;
 
@@ -271,22 +261,22 @@ int main(int argc, char** argv) {
 
     App app;
     app.data_dir = find_data_dir();
-    std::printf("data dir: %s\n", app.data_dir.string().c_str());
 
-    const fs::path initial = resolve_song(app.data_dir, song_arg);
-    if (!app.load_path(initial)) {
-        std::fprintf(stderr, "%s\n", app.status.c_str());
-        return 1;
-    }
-    for (const auto& s : kDuneSongs) {
-        if (song_arg == s.key || initial.filename() == s.file) {
-            app.song_key = s.key;
+    if (!song_arg.empty()) {
+        const fs::path initial = resolve_song(app.data_dir, song_arg);
+        if (!app.load_path(initial)) {
+            std::fprintf(stderr, "%s\n", app.status.c_str());
+            return 1;
         }
     }
 
     if (dump_sec > 0.f) {
+        if (!app.player) {
+            std::fprintf(stderr, "usage: imtrakker <module> --dump-wav <seconds> [out.wav]\n");
+            return 1;
+        }
         if (dump_path.empty()) {
-            dump_path = initial.stem().string() + ".wav";
+            dump_path = fs::path(app.open_path).stem().string() + ".wav";
         }
         dump_wav(*app.player, dump_sec, dump_path);
         return 0;
@@ -330,6 +320,12 @@ int main(int argc, char** argv) {
     }
     SDL_PauseAudioDevice(adev, 0);
 
+    auto apply_loaded_module = [&]() {
+        SDL_LockAudioDevice(adev);
+        bridge.player = app.player.get();
+        SDL_UnlockAudioDevice(adev);
+    };
+
     bool running = true;
     Uint64 prev = SDL_GetPerformanceCounter();
     while (running) {
@@ -338,6 +334,27 @@ int main(int argc, char** argv) {
             float(now - prev) / float(SDL_GetPerformanceFrequency());
         prev = now;
         app.flash = std::max(0.f, app.flash - dt);
+
+        // Complete async file dialog / typed open outside the ImGui frame.
+        if (app.pending_open && app.pending_open->ready()) {
+            auto selection = app.pending_open->result();
+            app.pending_open.reset();
+            if (!selection.empty()) {
+                app.pending_load = selection[0];
+            }
+        }
+        if (!app.pending_load.empty()) {
+            const fs::path path = app.pending_load;
+            app.pending_load.clear();
+            SDL_LockAudioDevice(adev);
+            bridge.player = nullptr;
+            SDL_UnlockAudioDevice(adev);
+            if (app.load_path(path)) {
+                apply_loaded_module();
+            } else if (app.player) {
+                apply_loaded_module();
+            }
+        }
 
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -349,25 +366,25 @@ int main(int argc, char** argv) {
                 const SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) {
                     running = false;
-                } else if (k == SDLK_SPACE) {
-                    app.player->set_playing(!app.player->playing());
-                } else if (k == SDLK_r) {
-                    app.player->restart();
-                    app.flash = 0.4f;
-                } else if (k == SDLK_LEFT) {
-                    app.player->seek_order(-1);
-                    app.flash = 0.3f;
-                } else if (k == SDLK_RIGHT) {
-                    app.player->seek_order(1);
-                    app.flash = 0.3f;
-                } else if (k == SDLK_1 || k == SDLK_2 || k == SDLK_3) {
-                    const char key[] = {char('m'), char('0' + (k - SDLK_0)), 0};
-                    app.load_dune(key);
-                    bridge.player = app.player.get();
-                } else if (k >= SDLK_F1 && k <= SDLK_F8) {
-                    app.player->toggle_mute(k - SDLK_F1);
-                } else if (k == SDLK_u) {
-                    app.player->unmute_all();
+                } else if (k == SDLK_o) {
+                    app.begin_browse();
+                } else if (app.player) {
+                    if (k == SDLK_SPACE) {
+                        app.player->set_playing(!app.player->playing());
+                    } else if (k == SDLK_r) {
+                        app.player->restart();
+                        app.flash = 0.4f;
+                    } else if (k == SDLK_LEFT) {
+                        app.player->seek_order(-1);
+                        app.flash = 0.3f;
+                    } else if (k == SDLK_RIGHT) {
+                        app.player->seek_order(1);
+                        app.flash = 0.3f;
+                    } else if (k >= SDLK_F1 && k <= SDLK_F8) {
+                        app.player->toggle_mute(k - SDLK_F1);
+                    } else if (k == SDLK_u) {
+                        app.player->unmute_all();
+                    }
                 }
             }
         }
@@ -376,9 +393,12 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        auto snap = app.player->snapshot();
-        if (snap.row_event) {
-            app.flash = std::max(app.flash, 0.1f);
+        mod::Player::Snapshot snap{};
+        if (app.player) {
+            snap = app.player->snapshot();
+            if (snap.row_event) {
+                app.flash = std::max(app.flash, 0.1f);
+            }
         }
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -389,42 +409,35 @@ int main(int argc, char** argv) {
 
         ImGui::TextColored(ImVec4(0.86f, 0.69f, 0.38f, 1.f), "IMTRAKKER");
         ImGui::SameLine();
-        ImGui::TextDisabled("  Amiga tracker  ·  %s", snap.magic.c_str());
-        ImGui::SameLine(ImGui::GetWindowWidth() - 280);
-        ImGui::TextDisabled("%s", app.data_dir.string().c_str());
+        ImGui::TextDisabled("  Amiga tracker  ·  %s",
+                            snap.magic.empty() ? "—" : snap.magic.c_str());
 
         ImGui::Separator();
 
-        for (const auto& s : kDuneSongs) {
-            const bool active = app.song_key == s.key;
-            if (active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.42f, 0.12f, 1.f));
-            }
-            if (ImGui::Button(s.key)) {
-                app.load_dune(s.key);
-                bridge.player = app.player.get();
-            }
-            if (active) {
-                ImGui::PopStyleColor();
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", s.label);
-            ImGui::SameLine(0, 24);
-        }
-
-        ImGui::SetNextItemWidth(360);
+        ImGui::SetNextItemWidth(520);
         ImGui::InputText("##open", app.open_path, sizeof(app.open_path));
         ImGui::SameLine();
-        if (ImGui::Button("Open")) {
-            if (app.open_path[0]) {
-                if (app.load_path(app.open_path)) {
-                    app.song_key.clear();
-                    bridge.player = app.player.get();
-                }
-            }
+        if (ImGui::Button("Browse...")) {
+            app.begin_browse();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open") && app.open_path[0]) {
+            app.request_open_typed();
         }
 
         ImGui::Separator();
+
+        if (!app.player) {
+            ImGui::TextWrapped("%s", app.status.c_str());
+            ImGui::TextDisabled("O / Browse...  ·  Esc quit");
+            ImGui::End();
+            ImGui::Render();
+            SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
+            SDL_RenderClear(renderer);
+            ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+            SDL_RenderPresent(renderer);
+            continue;
+        }
 
         if (ImGui::Button(snap.playing ? "Pause" : "Play")) {
             app.player->set_playing(!snap.playing);
@@ -446,7 +459,6 @@ int main(int argc, char** argv) {
                     snap.title.c_str(), snap.order_pos, snap.song_length, snap.pattern_index,
                     snap.row, snap.tick, snap.speed, snap.tempo);
 
-        // progress
         {
             const float total = float(std::max(1, snap.song_length * mod::kRows));
             const float cur = float(snap.order_pos * mod::kRows + snap.row);
@@ -454,10 +466,9 @@ int main(int argc, char** argv) {
         }
 
         ImGui::TextDisabled(
-            "1/2/3 dune  ·  Space  ·  Left/Right order  ·  F1-F8 mute  ·  U unmute  ·  R restart");
+            "O open  ·  Space  ·  Left/Right order  ·  F1-F8 mute  ·  U unmute  ·  R restart");
         ImGui::TextWrapped("%s", app.status.c_str());
 
-        // channels
         const int chn = snap.channels;
         if (ImGui::BeginTable("chs", std::max(1, chn), ImGuiTableFlags_SizingStretchSame)) {
             for (int ci = 0; ci < chn; ++ci) {
@@ -486,7 +497,6 @@ int main(int argc, char** argv) {
             ImGui::EndTable();
         }
 
-        // pattern
         ImGui::Separator();
         ImGui::Text("PATTERN #%02d", snap.pattern_index);
         const int visible = app.zoom_rows;
@@ -531,7 +541,6 @@ int main(int argc, char** argv) {
             ImGui::EndTable();
         }
 
-        // orders
         ImGui::Separator();
         ImGui::Text("ORDERS");
         ImGui::BeginChild("orders", ImVec2(0, 40), false, ImGuiWindowFlags_HorizontalScrollbar);
@@ -549,10 +558,11 @@ int main(int argc, char** argv) {
             } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.12f, 0.08f, 1.f));
             }
+            ImGui::PushID(i);
             if (ImGui::SmallButton(lab)) {
-                // seek by relative delta
                 app.player->seek_order(i - snap.order_pos);
             }
+            ImGui::PopID();
             ImGui::PopStyleColor();
         }
         ImGui::EndChild();

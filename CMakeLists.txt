@@ -42,6 +42,7 @@ add_executable(imtrakker
 
 target_include_directories(imtrakker PRIVATE
     src
+    external
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
@@ -52,6 +53,8 @@ target_link_libraries(imtrakker PRIVATE
 )
 
 if(WIN32)
+    # portable-file-dialogs (IFileDialog / GetOpenFileName)
+    target_link_libraries(imtrakker PRIVATE comdlg32 ole32 uuid shell32)
     add_custom_command(TARGET imtrakker POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:SDL2::SDL2>
@@ -60,7 +63,7 @@ if(WIN32)
     )
 endif()
 
-# Default: repo-local data/ (from build/). Dune ripped/ remains a find_data_dir fallback.
+# Relative fallback when resolving CLI module paths / IMTRAKKER_DATA is unset.
 target_compile_definitions(imtrakker PRIVATE
     IMTRAKKER_DEFAULT_DATA_DIR="../data"
 )

@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "imtrakker (Debug)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/x64/Debug/imtrakker.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "CMake: build Debug"
+        },
+        {
+            "name": "imtrakker (Release)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/x64/Release/imtrakker.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "CMake: build Release"
+        },
+        {
+            "name": "imtrakker (RelWithDebInfo)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/x64/RelWithDebInfo/imtrakker.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "CMake: build RelWithDebInfo"
+        },
+        {
+            "name": "imtrakker (MinSizeRel)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/x64/MinSizeRel/imtrakker.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "CMake: build MinSizeRel"
+        }
+    ]
+}

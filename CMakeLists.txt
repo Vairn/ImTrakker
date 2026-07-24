@@ -31,7 +31,10 @@ add_executable(imtrakker
     src/main.cpp
     src/hsq.cpp
     src/mod/module.cpp
+    src/mod/load_mmd.cpp
     src/mod/player.cpp
+    src/smus/smus_load.cpp
+    src/smus/smus_engine.cpp
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp

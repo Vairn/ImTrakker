@@ -17,11 +17,11 @@ void Player::load(Module module) {
     order_pos_ = 0;
     row_ = 0;
     tick_ = 0;
-    speed_ = 6;
-    tempo_ = 125;
+    speed_ = std::max(1, module_.initial_speed);
+    tempo_ = std::max(32, module_.initial_tempo);
     pattern_break_ = -1;
     pattern_jump_ = -1;
-    channels_.assign(size_t(module_.channels), ChannelState{});
+    channels_.assign(size_t(std::max(1, module_.channels)), ChannelState{});
     playing_ = true;
     finished_ = false;
     row_event_ = true;
@@ -89,7 +89,7 @@ int Player::pattern_index_unlocked() const {
 void Player::trigger(ChannelState& ch, const Note& note) {
     if (note.instrument) {
         const int ins = note.instrument;
-        if (ins >= 1 && ins <= 31) {
+        if (ins >= 1 && ins <= int(module_.samples.size())) {
             ch.instrument = ins;
             ch.sample = &module_.samples[size_t(ins - 1)];
             ch.volume = ch.sample->volume;
@@ -176,8 +176,10 @@ void Player::process_tick() {
     }
 
     const int pat = module_.orders[size_t(order_pos_)];
+    const int pat_rows =
+        (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size()) : 0;
     if (tick_ == 0) {
-        if (pat < 0 || pat >= module_.pattern_count()) {
+        if (pat < 0 || pat >= module_.pattern_count() || pat_rows <= 0 || row_ >= pat_rows) {
             return;
         }
         const auto& row_notes = module_.patterns[size_t(pat)][size_t(row_)];
@@ -204,10 +206,10 @@ void Player::process_tick() {
             if (order_pos_ >= module_.song_length) {
                 order_pos_ = module_.restart;
             }
-            row_ = std::min(63, pattern_break_);
+            row_ = std::min(std::max(0, pat_rows - 1), pattern_break_);
         } else {
             ++row_;
-            if (row_ >= kRows) {
+            if (row_ >= pat_rows) {
                 row_ = 0;
                 ++order_pos_;
                 if (order_pos_ >= module_.song_length) {
@@ -222,21 +224,14 @@ void Player::mix(float* left, float* right, int n) {
     std::fill(left, left + n, 0.f);
     std::fill(right, right + n, 0.f);
 
-    // Amiga-style alternating hard pan, extended for 6/8 ch.
-    static const float pans4[4][2] = {{1, 0}, {0, 1}, {0, 1}, {1, 0}};
+    // Amiga-style alternating hard pan, extended for up to 16 ch.
     static const float pans8[8][2] = {{1, 0}, {0, 1}, {0, 1}, {1, 0}, {1, 0}, {0, 1}, {0, 1}, {1, 0}};
 
     const float dt = float(n) / float(kSampleRate);
     for (size_t ci = 0; ci < channels_.size(); ++ci) {
         ChannelState& ch = channels_[ci];
-        float pl = 1.f, pr = 0.f;
-        if (channels_.size() <= 4) {
-            pl = pans4[ci % 4][0];
-            pr = pans4[ci % 4][1];
-        } else {
-            pl = pans8[ci % 8][0];
-            pr = pans8[ci % 8][1];
-        }
+        float pl = pans8[ci % 8][0];
+        float pr = pans8[ci % 8][1];
 
         if (ch.muted || !ch.sample || ch.period <= 0 || ch.volume <= 0) {
             ch.peak *= 0.85f;

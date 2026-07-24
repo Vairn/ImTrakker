@@ -46,16 +46,9 @@ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
     return buf;
 }
 
-Module load_module_bytes(std::vector<uint8_t> data, std::filesystem::path path) {
-    if (hsq_header_valid(data.data(), data.size()) && data.size() >= 6 && data[0] < 0x40) {
-        auto dec = hsq_decompress(data.data(), data.size());
-        if (!dec.empty()) {
-            data = std::move(dec);
-        }
-    }
-
+Module load_protracker(std::vector<uint8_t> data, std::filesystem::path path) {
     if (data.size() < 1084) {
-        throw std::runtime_error("too small for a module");
+        throw std::runtime_error("too small for a ProTracker module");
     }
 
     Module mod;
@@ -97,6 +90,7 @@ Module load_module_bytes(std::vector<uint8_t> data, std::filesystem::path path) 
     mod.magic.assign(reinterpret_cast<const char*>(data.data() + 1080), 4);
     mod.channels = channels_for_magic(mod.magic);
     if (mod.channels <= 0) {
+        // 15-instrument SoundTracker: no magic, patterns start at 600
         throw std::runtime_error("unsupported magic: " + mod.magic);
     }
     if (mod.restart >= mod.song_length) {
@@ -168,6 +162,33 @@ Module load_module_bytes(std::vector<uint8_t> data, std::filesystem::path path) 
         mod.title = mod.path.stem().string();
     }
     return mod;
+}
+
+Module load_module_bytes(std::vector<uint8_t> data, std::filesystem::path path) {
+    if (data.size() >= 6 && hsq_header_valid(data.data(), data.size()) && data[0] < 0x40) {
+        try {
+            auto dec = hsq_decompress(data.data(), data.size());
+            if (!dec.empty()) {
+                data = std::move(dec);
+            }
+        } catch (...) {
+            // keep original bytes
+        }
+    }
+
+    if (data.size() >= 12 && std::memcmp(data.data(), "FORM", 4) == 0 &&
+        std::memcmp(data.data() + 8, "SMUS", 4) == 0) {
+        throw std::runtime_error("SMUS scores use the Sonix engine — open via the UI/CLI smus path");
+    }
+
+    if (data.size() >= 52 && (std::memcmp(data.data(), "MMD0", 4) == 0 ||
+                              std::memcmp(data.data(), "MMD1", 4) == 0 ||
+                              std::memcmp(data.data(), "MMD2", 4) == 0 ||
+                              std::memcmp(data.data(), "MMD3", 4) == 0)) {
+        return load_mmd(std::move(data), std::move(path));
+    }
+
+    return load_protracker(std::move(data), std::move(path));
 }
 
 Module load_module(const std::filesystem::path& path) {

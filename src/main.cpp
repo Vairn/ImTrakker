@@ -1,5 +1,6 @@
 #include "mod/module.hpp"
 #include "mod/player.hpp"
+#include "smus/smus.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -55,13 +56,11 @@ static fs::path resolve_song(const fs::path& data, const std::string& arg) {
         return p;
     }
     if (arg.find('.') == std::string::npos) {
-        p = data / (arg + ".mod");
-        if (fs::is_regular_file(p)) {
-            return p;
-        }
-        p = data / (arg + ".hsq");
-        if (fs::is_regular_file(p)) {
-            return p;
+        for (const char* ext : {".mod", ".hsq", ".mmd0", ".mmd1", ".smus"}) {
+            p = data / (arg + ext);
+            if (fs::is_regular_file(p)) {
+                return p;
+            }
         }
     }
     return fs::path(arg);
@@ -101,6 +100,7 @@ static void apply_style() {
 struct App {
     fs::path data_dir;
     std::unique_ptr<mod::Player> player;
+    std::unique_ptr<smus::Engine> smus;
     std::string status = "Open a module to begin";
     char open_path[512]{};
     int zoom_rows = 14;
@@ -108,16 +108,27 @@ struct App {
     std::shared_ptr<pfd::open_file> pending_open;
     std::string pending_load;
 
+    bool has_song() const { return player || smus; }
+
     bool load_path(const fs::path& path) {
         try {
-            auto module = mod::load_module(path);
-            if (!player) {
-                player = std::make_unique<mod::Player>(std::move(module));
+            if (smus::is_smus_file(path)) {
+                player.reset();
+                smus = smus::Engine::load(path);
+                status = path.string() + "  (SMUS / Sonix, " +
+                         std::to_string(smus->score().tracks.size()) + " tracks, " +
+                         std::to_string(int(smus->bpm())) + " BPM)";
             } else {
-                player->load(std::move(module));
+                smus.reset();
+                auto module = mod::load_module(path);
+                if (!player) {
+                    player = std::make_unique<mod::Player>(std::move(module));
+                } else {
+                    player->load(std::move(module));
+                }
+                status = path.string() + "  (" + player->module().magic + ", " +
+                         std::to_string(player->module().channels) + "ch)";
             }
-            status = path.string() + "  (" + player->module().magic + ", " +
-                     std::to_string(player->module().channels) + "ch)";
             std::strncpy(open_path, path.string().c_str(), sizeof(open_path) - 1);
             open_path[sizeof(open_path) - 1] = '\0';
             flash = 0.5f;
@@ -135,7 +146,9 @@ struct App {
         const std::string start = open_path[0] ? open_path : ".";
         pending_open = std::make_shared<pfd::open_file>(
             "Open module", start,
-            std::vector<std::string>{"Tracker modules", "*.mod *.hsq", "All files", "*.*"});
+            std::vector<std::string>{
+                "Modules", "*.mod *.hsq *.mmd0 *.mmd1 *.mmd2 *.mmd3 *.smus",
+                "All files", "*.*"});
     }
 
     void request_open_typed() {
@@ -147,34 +160,31 @@ struct App {
 
 struct AudioBridge {
     mod::Player* player = nullptr;
+    smus::Engine* smus = nullptr;
 };
 
 static void SDLCALL audio_callback(void* userdata, Uint8* stream, int len) {
     auto* bridge = static_cast<AudioBridge*>(userdata);
     const int n_frames = len / int(sizeof(float) * 2);
     auto* out = reinterpret_cast<float*>(stream);
-    if (!bridge->player) {
+    if (bridge->smus) {
+        bridge->smus->render(out, n_frames);
+    } else if (bridge->player) {
+        bridge->player->render(out, n_frames);
+    } else {
         std::memset(out, 0, size_t(len));
-        return;
     }
-    bridge->player->render(out, n_frames);
 }
 
-static void dump_wav(mod::Player& player, float seconds, const fs::path& out) {
-    const int n = int(mod::kSampleRate * seconds);
-    std::vector<float> pcm(size_t(n) * 2);
-    player.set_playing(true);
-    player.render(pcm.data(), n);
-    std::vector<int16_t> i16(size_t(n) * 2);
+static void write_wav(const fs::path& out, const std::vector<float>& pcm, int sr) {
+    std::vector<int16_t> i16(pcm.size());
     float peak = 0.f;
     for (size_t i = 0; i < pcm.size(); ++i) {
         peak = std::max(peak, std::fabs(pcm[i]));
-        const float c = std::clamp(pcm[i], -1.f, 1.f);
-        i16[i] = int16_t(c * 32767.f);
+        i16[i] = int16_t(std::clamp(pcm[i], -1.f, 1.f) * 32767.f);
     }
     std::ofstream f(out, std::ios::binary);
     const int data_bytes = int(i16.size() * sizeof(int16_t));
-    const int sr = mod::kSampleRate;
     const int byte_rate = sr * 2 * 2;
     f.write("RIFF", 4);
     const uint32_t chunk = 36 + uint32_t(data_bytes);
@@ -195,7 +205,24 @@ static void dump_wav(mod::Player& player, float seconds, const fs::path& out) {
     f.write("data", 4);
     f.write(reinterpret_cast<const char*>(&data_bytes), 4);
     f.write(reinterpret_cast<const char*>(i16.data()), data_bytes);
-    std::printf("wrote %s (%.1fs, peak=%.3f)\n", out.string().c_str(), seconds, peak);
+    std::printf("wrote %s (%.1fs, peak=%.3f)\n", out.string().c_str(),
+                float(pcm.size() / 2) / float(sr), peak);
+}
+
+static void dump_wav_mod(mod::Player& player, float seconds, const fs::path& out) {
+    const int n = int(mod::kSampleRate * seconds);
+    std::vector<float> pcm(size_t(n) * 2);
+    player.set_playing(true);
+    player.render(pcm.data(), n);
+    write_wav(out, pcm, mod::kSampleRate);
+}
+
+static void dump_wav_smus(smus::Engine& eng, float seconds, const fs::path& out) {
+    const int n = int(eng.sample_rate() * seconds);
+    std::vector<float> pcm(size_t(n) * 2);
+    eng.set_playing(true);
+    eng.render(pcm.data(), n);
+    write_wav(out, pcm, eng.sample_rate());
 }
 
 static ImVec4 ch_color(int i) {
@@ -271,14 +298,18 @@ int main(int argc, char** argv) {
     }
 
     if (dump_sec > 0.f) {
-        if (!app.player) {
+        if (!app.has_song()) {
             std::fprintf(stderr, "usage: imtrakker <module> --dump-wav <seconds> [out.wav]\n");
             return 1;
         }
         if (dump_path.empty()) {
             dump_path = fs::path(app.open_path).stem().string() + ".wav";
         }
-        dump_wav(*app.player, dump_sec, dump_path);
+        if (app.smus) {
+            dump_wav_smus(*app.smus, dump_sec, dump_path);
+        } else {
+            dump_wav_mod(*app.player, dump_sec, dump_path);
+        }
         return 0;
     }
 
@@ -305,7 +336,7 @@ int main(int argc, char** argv) {
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
 
-    AudioBridge bridge{app.player.get()};
+    AudioBridge bridge{app.player.get(), app.smus.get()};
     SDL_AudioSpec want{}, have{};
     want.freq = mod::kSampleRate;
     want.format = AUDIO_F32SYS;
@@ -323,6 +354,7 @@ int main(int argc, char** argv) {
     auto apply_loaded_module = [&]() {
         SDL_LockAudioDevice(adev);
         bridge.player = app.player.get();
+        bridge.smus = app.smus.get();
         SDL_UnlockAudioDevice(adev);
     };
 
@@ -348,10 +380,11 @@ int main(int argc, char** argv) {
             app.pending_load.clear();
             SDL_LockAudioDevice(adev);
             bridge.player = nullptr;
+            bridge.smus = nullptr;
             SDL_UnlockAudioDevice(adev);
             if (app.load_path(path)) {
                 apply_loaded_module();
-            } else if (app.player) {
+            } else if (app.has_song()) {
                 apply_loaded_module();
             }
         }
@@ -368,6 +401,13 @@ int main(int argc, char** argv) {
                     running = false;
                 } else if (k == SDLK_o) {
                     app.begin_browse();
+                } else if (app.smus) {
+                    if (k == SDLK_SPACE) {
+                        app.smus->set_playing(!app.smus->playing());
+                    } else if (k == SDLK_r) {
+                        app.smus->restart();
+                        app.flash = 0.4f;
+                    }
                 } else if (app.player) {
                     if (k == SDLK_SPACE) {
                         app.player->set_playing(!app.player->playing());
@@ -394,11 +434,14 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
 
         mod::Player::Snapshot snap{};
+        smus::Engine::Snapshot ssnap{};
         if (app.player) {
             snap = app.player->snapshot();
             if (snap.row_event) {
                 app.flash = std::max(app.flash, 0.1f);
             }
+        } else if (app.smus) {
+            ssnap = app.smus->snapshot();
         }
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -409,8 +452,12 @@ int main(int argc, char** argv) {
 
         ImGui::TextColored(ImVec4(0.86f, 0.69f, 0.38f, 1.f), "IMTRAKKER");
         ImGui::SameLine();
-        ImGui::TextDisabled("  Amiga tracker  ·  %s",
-                            snap.magic.empty() ? "—" : snap.magic.c_str());
+        if (app.smus) {
+            ImGui::TextDisabled("  Sonix SMUS  ·  %.0f BPM", ssnap.bpm);
+        } else {
+            ImGui::TextDisabled("  Amiga tracker  ·  %s",
+                                snap.magic.empty() ? "—" : snap.magic.c_str());
+        }
 
         ImGui::Separator();
 
@@ -427,9 +474,42 @@ int main(int argc, char** argv) {
 
         ImGui::Separator();
 
-        if (!app.player) {
+        if (!app.has_song()) {
             ImGui::TextWrapped("%s", app.status.c_str());
             ImGui::TextDisabled("O / Browse...  ·  Esc quit");
+            ImGui::End();
+            ImGui::Render();
+            SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
+            SDL_RenderClear(renderer);
+            ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+            SDL_RenderPresent(renderer);
+            continue;
+        }
+
+        if (app.smus) {
+            if (ImGui::Button(ssnap.playing ? "Pause" : "Play")) {
+                app.smus->set_playing(!ssnap.playing);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Restart")) {
+                app.smus->restart();
+            }
+            ImGui::SameLine();
+            ImGui::Text("%s   %.1f BPM   %s", ssnap.title.c_str(), ssnap.bpm,
+                        ssnap.finished ? "END" : "PLAYING");
+            ImGui::TextDisabled("Space  ·  R restart  ·  O open");
+            ImGui::TextWrapped("%s", app.status.c_str());
+            if (ImGui::BeginTable("smus_ch", 4, ImGuiTableFlags_SizingStretchSame)) {
+                for (int ci = 0; ci < 4; ++ci) {
+                    ImGui::TableNextColumn();
+                    ImGui::Text("AUD%d", ci);
+                    ImGui::TextDisabled("evt %d%s", ssnap.track_index[size_t(ci)],
+                                        ssnap.track_done[size_t(ci)] ? " done" : "");
+                    draw_vu("vu", std::min(1.f, ssnap.voice_peak[size_t(ci)] * 2.4f),
+                            std::min(1.f, ssnap.voice_peak[size_t(ci)] * 2.4f), ch_color(ci));
+                }
+                ImGui::EndTable();
+            }
             ImGui::End();
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
@@ -460,8 +540,9 @@ int main(int argc, char** argv) {
                     snap.row, snap.tick, snap.speed, snap.tempo);
 
         {
-            const float total = float(std::max(1, snap.song_length * mod::kRows));
-            const float cur = float(snap.order_pos * mod::kRows + snap.row);
+            const int rows = snap.pattern.empty() ? mod::kRows : int(snap.pattern.size());
+            const float total = float(std::max(1, snap.song_length * rows));
+            const float cur = float(snap.order_pos * rows + snap.row);
             ImGui::ProgressBar(cur / total, ImVec2(-1, 10), "");
         }
 
@@ -479,7 +560,7 @@ int main(int argc, char** argv) {
                 ImGui::PopStyleColor();
                 ImGui::Text("%s  %s", ch.last_note, ch.last_fx);
                 std::string sname = "—";
-                if (ch.instrument >= 1 && ch.instrument <= 31) {
+                if (ch.instrument >= 1 && ch.instrument <= int(app.player->module().samples.size())) {
                     sname = app.player->module().samples[size_t(ch.instrument - 1)].name;
                     if (sname.empty()) {
                         sname = "#" + std::to_string(ch.instrument);
@@ -499,9 +580,10 @@ int main(int argc, char** argv) {
 
         ImGui::Separator();
         ImGui::Text("PATTERN #%02d", snap.pattern_index);
-        const int visible = app.zoom_rows;
+        const int pat_rows = snap.pattern.empty() ? 0 : int(snap.pattern.size());
+        const int visible = std::min(app.zoom_rows, std::max(1, pat_rows));
         const int start =
-            std::clamp(snap.row - visible / 2, 0, std::max(0, mod::kRows - visible));
+            std::clamp(snap.row - visible / 2, 0, std::max(0, pat_rows - visible));
         if (ImGui::BeginTable("pat", 1 + chn,
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY,
@@ -515,7 +597,7 @@ int main(int argc, char** argv) {
             ImGui::TableHeadersRow();
             for (int vi = 0; vi < visible; ++vi) {
                 const int row = start + vi;
-                if (row >= mod::kRows) {
+                if (row >= pat_rows) {
                     break;
                 }
                 ImGui::TableNextRow();

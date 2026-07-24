@@ -16,7 +16,7 @@ struct Sample {
     int volume = 64;
     int repstart_words = 0;
     int replen_words = 0;
-    std::vector<float> data;  // signed PCM normalized to [-1,1]
+    std::vector<float> wave;  // signed PCM normalized to [-1,1]
 };
 
 struct Note {
@@ -50,5 +50,9 @@ Module load_module_bytes(std::vector<uint8_t> data, std::filesystem::path path =
 
 Module load_protracker(std::vector<uint8_t> data, std::filesystem::path path);
 Module load_mmd(std::vector<uint8_t> data, std::filesystem::path path);
+
+Module make_blank(int channels = 4);
+void save_protracker(const Module& mod, const std::filesystem::path& path);
+std::string magic_for_channels(int channels);
 
 }  // namespace mod

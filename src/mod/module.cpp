@@ -140,20 +140,20 @@ Module load_protracker(std::vector<uint8_t> data, std::filesystem::path path) {
     for (Sample& s : mod.samples) {
         const size_t nbytes = size_t(s.length_words) * 2;
         if (nbytes == 0) {
-            s.data = {0.f, 0.f};
+            s.wave = {0.f, 0.f};
             continue;
         }
         if (sample_pos + nbytes > data.size()) {
-            s.data.assign(2, 0.f);
+            s.wave.assign(2, 0.f);
             break;
         }
-        s.data.resize(nbytes);
+        s.wave.resize(nbytes);
         for (size_t i = 0; i < nbytes; ++i) {
-            s.data[i] = float(int8_t(data[sample_pos + i])) / 128.f;
+            s.wave[i] = float(int8_t(data[sample_pos + i])) / 128.f;
         }
         if (nbytes >= 2) {
-            s.data[0] = 0.f;
-            s.data[1] = 0.f;
+            s.wave[0] = 0.f;
+            s.wave[1] = 0.f;
         }
         sample_pos += nbytes;
     }

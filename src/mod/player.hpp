@@ -36,8 +36,14 @@ public:
     void load(Module module);
     void restart();
     void seek_order(int delta);
+    void seek_row(int order, int row);
     void set_playing(bool on) { playing_ = on; }
     bool playing() const { return playing_; }
+
+    // One-shot sample preview (mixed on top of song when playing, or alone when paused).
+    void audition(int instrument_1based, int period);
+    void stop_audition();
+    bool auditioning() const { return audition_active_; }
 
     // Interleaved stereo float32 in [-1,1]. Thread-safe vs UI snapshot.
     void render(float* interleaved_stereo, int n_frames);
@@ -77,6 +83,8 @@ private:
     int samples_per_tick() const;
     int pattern_index_unlocked() const;
 
+    void mix_audition(float* left, float* right, int n);
+
     Module module_;
     int order_pos_ = 0;
     int row_ = 0;
@@ -91,6 +99,12 @@ private:
     bool row_event_ = false;
     int tick_left_ = 0;
     std::mutex mutex_;
+
+    bool audition_active_ = false;
+    const Sample* audition_sample_ = nullptr;
+    double audition_pos_ = 0.0;
+    int audition_period_ = 0;
+    int audition_volume_ = 64;
 };
 
 }  // namespace mod

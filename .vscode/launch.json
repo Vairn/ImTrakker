@@ -7,7 +7,10 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/x64/Debug/imtrakker.exe",
             "args": [],
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/build/x64/Debug",
+            "env": {
+                "PATH": "${workspaceFolder}/build/x64/Debug;${env:PATH}"
+            },
             "preLaunchTask": "CMake: build Debug"
         },
         {
@@ -16,7 +19,10 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/x64/Release/imtrakker.exe",
             "args": [],
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/build/x64/Release",
+            "env": {
+                "PATH": "${workspaceFolder}/build/x64/Release;${env:PATH}"
+            },
             "preLaunchTask": "CMake: build Release"
         },
         {
@@ -25,7 +31,10 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/x64/RelWithDebInfo/imtrakker.exe",
             "args": [],
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/build/x64/RelWithDebInfo",
+            "env": {
+                "PATH": "${workspaceFolder}/build/x64/RelWithDebInfo;${env:PATH}"
+            },
             "preLaunchTask": "CMake: build RelWithDebInfo"
         },
         {
@@ -34,7 +43,10 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/x64/MinSizeRel/imtrakker.exe",
             "args": [],
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/build/x64/MinSizeRel",
+            "env": {
+                "PATH": "${workspaceFolder}/build/x64/MinSizeRel;${env:PATH}"
+            },
             "preLaunchTask": "CMake: build MinSizeRel"
         }
     ]

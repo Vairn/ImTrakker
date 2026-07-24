@@ -1,5 +1,8 @@
 #include "mod/module.hpp"
 #include "mod/player.hpp"
+#include "mod/editor.hpp"
+#include "mod/sample_io.hpp"
+#include "mod/sample_edit.hpp"
 #include "smus/smus.hpp"
 
 #ifndef NOMINMAX
@@ -15,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -116,14 +120,26 @@ struct App {
     fs::path data_dir;
     std::unique_ptr<mod::Player> player;
     std::unique_ptr<smus::Engine> smus;
-    std::string status = "Open a module to begin";
+    mod::EditorState editor;
+    std::string status = "Open a module or New to compose";
     char open_path[512]{};
     int zoom_rows = 14;
     float flash = 0.f;
     bool show_options = false;
+    bool show_help = false;
     ViewOpts view;
     std::shared_ptr<pfd::open_file> pending_open;
+    std::shared_ptr<pfd::save_file> pending_save;
+    std::shared_ptr<pfd::open_file> pending_sample_open;
+    std::shared_ptr<pfd::save_file> pending_sample_save;
     std::string pending_load;
+    std::string pending_save_path;
+    std::string pending_sample_load;
+    std::string pending_sample_save_path;
+    int pending_sample_save_fmt = 0;  // 0 wav, 1 8svx, 2 raw
+    int pending_steal_instr = 1;
+    bool pending_steal_mod = false;
+    char sample_name_buf[23]{};
 
     bool has_song() const { return player || smus; }
 
@@ -143,6 +159,14 @@ struct App {
                 } else {
                     player->load(std::move(module));
                 }
+                editor.reset_for_module(player->module());
+                {
+                    std::lock_guard lock(player->mutex());
+                    if (player->module().samples.size() < 31) {
+                        player->module().samples.resize(31);
+                    }
+                }
+                sync_sample_name_buf();
                 status = path.string() + "  (" + player->module().magic + ", " +
                          std::to_string(player->module().channels) + "ch)";
             }
@@ -152,6 +176,54 @@ struct App {
             return true;
         } catch (const std::exception& e) {
             status = std::string("load failed: ") + e.what();
+            return false;
+        }
+    }
+
+    void sync_sample_name_buf() {
+        std::memset(sample_name_buf, 0, sizeof(sample_name_buf));
+        if (!player) {
+            return;
+        }
+        const auto& s = player->module().samples[size_t(std::clamp(editor.sample_slot, 0, 30))];
+        std::strncpy(sample_name_buf, s.name.c_str(), sizeof(sample_name_buf) - 1);
+    }
+
+    void new_song(int channels = 4) {
+        smus.reset();
+        auto module = mod::make_blank(channels);
+        if (!player) {
+            player = std::make_unique<mod::Player>(std::move(module));
+        } else {
+            player->load(std::move(module));
+        }
+        editor.reset_for_module(player->module());
+        editor.mark_dirty();
+        sync_sample_name_buf();
+        std::strncpy(open_path, "untitled.mod", sizeof(open_path) - 1);
+        open_path[sizeof(open_path) - 1] = '\0';
+        status = "New song (4ch M.K.) — edit and Save As…";
+        flash = 0.5f;
+    }
+
+    bool save_to(const fs::path& path) {
+        if (!player) {
+            return false;
+        }
+        try {
+            {
+                std::lock_guard lock(player->mutex());
+                player->module().title = editor.title_buf;
+                player->module().path = path;
+                mod::save_protracker(player->module(), path);
+            }
+            editor.clear_dirty();
+            std::strncpy(open_path, path.string().c_str(), sizeof(open_path) - 1);
+            open_path[sizeof(open_path) - 1] = '\0';
+            status = "saved " + path.string();
+            return true;
+        } catch (const std::exception& e) {
+            status = std::string("save failed: ") + e.what();
             return false;
         }
     }
@@ -166,6 +238,47 @@ struct App {
             std::vector<std::string>{
                 "Modules", "*.mod *.hsq *.mmd0 *.mmd1 *.mmd2 *.mmd3 *.smus",
                 "All files", "*.*"});
+    }
+
+    void begin_save_as() {
+        if (pending_save || !player) {
+            return;
+        }
+        const std::string start = open_path[0] ? open_path : "untitled.mod";
+        pending_save = std::make_shared<pfd::save_file>(
+            "Save module", start,
+            std::vector<std::string>{"ProTracker module", "*.mod", "All files", "*.*"});
+    }
+
+    void begin_sample_load(bool from_mod) {
+        if (pending_sample_open || !player) {
+            return;
+        }
+        pending_steal_mod = from_mod;
+        const std::string start = open_path[0] ? open_path : ".";
+        if (from_mod) {
+            pending_sample_open = std::make_shared<pfd::open_file>(
+                "Load sample from module", start,
+                std::vector<std::string>{"Modules", "*.mod *.mmd0 *.mmd1 *.mmd2 *.mmd3", "All files",
+                                         "*.*"});
+        } else {
+            pending_sample_open = std::make_shared<pfd::open_file>(
+                "Load sample", start,
+                std::vector<std::string>{
+                    "Samples", "*.wav *.iff *.8svx *.raw *.smp", "WAV", "*.wav", "IFF 8SVX",
+                    "*.iff *.8svx", "RAW", "*.raw *.smp", "All files", "*.*"});
+        }
+    }
+
+    void begin_sample_save(int fmt) {
+        if (pending_sample_save || !player) {
+            return;
+        }
+        pending_sample_save_fmt = fmt;
+        const char* def = fmt == 1 ? "sample.iff" : (fmt == 2 ? "sample.raw" : "sample.wav");
+        pending_sample_save = std::make_shared<pfd::save_file>(
+            "Save sample", def,
+            std::vector<std::string>{"Sample", "*.wav *.iff *.raw", "All files", "*.*"});
     }
 
     void request_open_typed() {
@@ -397,7 +510,223 @@ static void draw_vu(const char* id, float level, float hold, bool muted, float h
     ImGui::PopID();
 }
 
-// Horizontal spectrum strip — crude DFT magnitudes from a mono scope buffer.
+static void draw_waveform(const char* id, const mod::Sample& s, mod::SampleSel& sel, float zoom,
+                          float scroll, float height = 120.f) {
+    ImGui::PushID(id);
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = height;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(16, 12, 10, 255));
+    dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(80, 50, 25, 255));
+
+    const int n = int(s.wave.size());
+    if (n > 1 && w > 2.f) {
+        const float view = std::clamp(1.f / std::max(0.1f, zoom), 0.02f, 1.f);
+        const float start_f = std::clamp(scroll, 0.f, 1.f - view);
+        const int i0 = int(start_f * float(n));
+        const int i1 = std::min(n, int((start_f + view) * float(n)));
+        const int span = std::max(1, i1 - i0);
+        const float mid = p0.y + h * 0.5f;
+        dl->AddLine(ImVec2(p0.x, mid), ImVec2(p0.x + w, mid), IM_COL32(40, 30, 20, 255));
+
+        if (sel.active()) {
+            const float xa = p0.x + float(sel.start - i0) / float(span) * w;
+            const float xb = p0.x + float(sel.end - i0) / float(span) * w;
+            dl->AddRectFilled(ImVec2(std::max(p0.x, xa), p0.y + 1),
+                              ImVec2(std::min(p0.x + w, xb), p0.y + h - 1),
+                              IM_COL32(180, 90, 30, 60));
+        }
+
+        if (s.replen_words > 1) {
+            const int ls = s.repstart_words * 2;
+            const int le = ls + s.replen_words * 2;
+            const float xa = p0.x + float(ls - i0) / float(span) * w;
+            const float xb = p0.x + float(le - i0) / float(span) * w;
+            dl->AddLine(ImVec2(xa, p0.y), ImVec2(xa, p0.y + h), IM_COL32(80, 200, 120, 200));
+            dl->AddLine(ImVec2(xb, p0.y), ImVec2(xb, p0.y + h), IM_COL32(80, 200, 120, 200));
+        }
+
+        const int step = std::max(1, span / int(w));
+        for (int x = 0; x < int(w); ++x) {
+            const int ia = i0 + int(float(x) / w * float(span));
+            float mn = 1.f, mx = -1.f;
+            for (int i = ia; i < ia + step && i < i1; ++i) {
+                mn = std::min(mn, s.wave[size_t(i)]);
+                mx = std::max(mx, s.wave[size_t(i)]);
+            }
+            const float y0 = mid - mx * (h * 0.45f);
+            const float y1 = mid - mn * (h * 0.45f);
+            const float xx = p0.x + float(x);
+            dl->AddLine(ImVec2(xx, y0), ImVec2(xx, y1), IM_COL32(230, 160, 70, 220));
+        }
+
+        ImGui::InvisibleButton("##wave", ImVec2(w, h));
+        if (ImGui::IsItemActive() || ImGui::IsItemClicked()) {
+            const float mx = ImGui::GetIO().MousePos.x - p0.x;
+            const int idx = std::clamp(i0 + int(mx / w * float(span)), 0, n);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                sel.start = idx;
+                sel.end = idx;
+            }
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                sel.end = idx;
+            }
+        }
+    } else {
+        ImGui::Dummy(ImVec2(w, h));
+    }
+    ImGui::PopID();
+}
+
+static void draw_sample_editor(App& app) {
+    auto& ed = app.editor;
+    auto& player = *app.player;
+    auto& modu = player.module();
+
+    if (ImGui::BeginTable("smp_layout", 2, ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("list", ImGuiTableColumnFlags_WidthFixed, 220.f);
+        ImGui::TableSetupColumn("edit", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("smp_list", ImVec2(0, 280), true);
+        for (int i = 0; i < 31; ++i) {
+            const auto& samp = modu.samples[size_t(i)];
+            char lab[64];
+            std::snprintf(lab, sizeof(lab), "%02d %s  (%d)", i + 1,
+                          samp.name.empty() ? "--------" : samp.name.c_str(), samp.length_words * 2);
+            if (ImGui::Selectable(lab, ed.sample_slot == i)) {
+                ed.sample_slot = i;
+                app.sync_sample_name_buf();
+                {
+                    std::lock_guard lock(player.mutex());
+                    mod::sample_sel_all(ed.current_sample(modu), ed.sample_sel);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::TableNextColumn();
+        int vol = 64, ft = 0, rep_s = 0, rep_l = 1;
+        int data_len = 0;
+        mod::Sample wave_copy;
+        {
+            std::lock_guard lock(player.mutex());
+            auto& s = ed.current_sample(modu);
+            vol = s.volume;
+            ft = s.finetune;
+            rep_s = s.repstart_words;
+            rep_l = s.replen_words;
+            data_len = int(s.wave.size());
+            wave_copy = s;
+        }
+
+        ImGui::SetNextItemWidth(180);
+        if (ImGui::InputText("Name", app.sample_name_buf, sizeof(app.sample_name_buf))) {
+            std::lock_guard lock(player.mutex());
+            ed.current_sample(modu).name = app.sample_name_buf;
+            ed.mark_dirty();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        if (ImGui::SliderInt("Vol", &vol, 0, 64)) {
+            std::lock_guard lock(player.mutex());
+            ed.current_sample(modu).volume = vol;
+            ed.mark_dirty();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        if (ImGui::SliderInt("Ft", &ft, -8, 7)) {
+            std::lock_guard lock(player.mutex());
+            ed.current_sample(modu).finetune = ft;
+            ed.mark_dirty();
+        }
+
+        ImGui::Text("Len %d bytes   Loop %d + %d words", data_len, rep_s, rep_l);
+        ImGui::SliderFloat("Zoom", &ed.wave_zoom, 1.f, 32.f, "%.1fx");
+        ImGui::SameLine();
+        ImGui::SliderFloat("Scroll", &ed.wave_scroll, 0.f, 1.f, "%.2f");
+        draw_waveform("wf", wave_copy, ed.sample_sel, ed.wave_zoom, ed.wave_scroll, 130.f);
+
+        if (ImGui::Button("Load…")) {
+            app.begin_sample_load(false);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("From MOD…")) {
+            app.begin_sample_load(true);
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("RAW unsigned", &ed.raw_unsigned);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(50);
+        ImGui::DragInt("Steal#", &ed.steal_instr, 1, 1, 31);
+        ImGui::SameLine();
+        if (ImGui::Button("Save WAV")) {
+            app.begin_sample_save(0);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save 8SVX")) {
+            app.begin_sample_save(1);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save RAW")) {
+            app.begin_sample_save(2);
+        }
+
+        auto op = [&](const char* label, auto fn) {
+            if (ImGui::SmallButton(label)) {
+                ed.with_sample_edit(modu, player.mutex(), label, fn);
+                app.sync_sample_name_buf();
+            }
+        };
+        op("Cut", [&](mod::Sample& sm, mod::SampleSel& sel) {
+            mod::sample_cut(sm, sel, ed.sample_clip);
+        });
+        ImGui::SameLine();
+        op("Copy", [&](mod::Sample& sm, mod::SampleSel& sel) {
+            mod::sample_copy(sm, sel, ed.sample_clip);
+        });
+        ImGui::SameLine();
+        op("Paste", [&](mod::Sample& sm, mod::SampleSel& sel) {
+            mod::sample_paste(sm, sel, ed.sample_clip);
+        });
+        ImGui::SameLine();
+        op("Clear", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_clear(sm, sel); });
+        ImGui::SameLine();
+        op("Crop", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_crop(sm, sel); });
+        ImGui::SameLine();
+        op("Rev", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_reverse(sm, sel); });
+        ImGui::SameLine();
+        op("Inv", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_invert(sm, sel); });
+        ImGui::SameLine();
+        op("Boost", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_boost(sm, sel); });
+        ImGui::SameLine();
+        op("Filter", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_filter(sm, sel); });
+        ImGui::SameLine();
+        op("FadeIn", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_fade_in(sm, sel); });
+        ImGui::SameLine();
+        op("FadeOut", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_fade_out(sm, sel); });
+
+        ImGui::SetNextItemWidth(70);
+        ImGui::DragFloat("Gain", &ed.amplify_gain, 0.05f, 0.1f, 4.f, "%.2f");
+        ImGui::SameLine();
+        op("Amp", [&](mod::Sample& sm, mod::SampleSel& sel) {
+            mod::sample_amplify(sm, sel, ed.amplify_gain);
+        });
+        ImGui::SameLine();
+        op("Oct-", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_resample(sm, sel, 0.5f); });
+        ImGui::SameLine();
+        op("Oct+", [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_resample(sm, sel, 2.f); });
+        ImGui::SameLine();
+        op("LoopSel",
+           [&](mod::Sample& sm, mod::SampleSel& sel) { mod::sample_set_loop_from_sel(sm, sel); });
+        ImGui::SameLine();
+        op("NoLoop", [&](mod::Sample& sm, mod::SampleSel&) { mod::sample_disable_loop(sm); });
+
+        ImGui::TextDisabled("Audition: tracker note keys  ·  Esc stops preview");
+        ImGui::EndTable();
+    }
+}
+
 static void draw_spectrum(const char* id, const float* samples, int n, float height = 48.f) {
     ImGui::PushID(id);
     constexpr int kBins = 16;
@@ -446,6 +775,168 @@ static void draw_spectrum(const char* id, const float* samples, int n, float hei
     }
     ImGui::Dummy(ImVec2(w, h));
     ImGui::PopID();
+}
+
+static void draw_help_window(App& app) {
+    if (!app.show_help) {
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("How to use ImTrakker", &app.show_help)) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::BeginTabBar("help_tabs")) {
+        if (ImGui::BeginTabItem("Quick start")) {
+            ImGui::TextWrapped(
+                "ImTrakker is an Amiga ProTracker-style player and editor. Compose in the "
+                "pattern grid, load samples, then Save as a .mod file.");
+            ImGui::Spacing();
+            ImGui::BulletText("New — start a blank 4-channel song");
+            ImGui::BulletText("Browse / Open — load .mod, MMD, or .smus");
+            ImGui::BulletText("Turn Edit on (toolbar) before typing notes");
+            ImGui::BulletText("F9 Pattern editor  ·  F10 Sample editor");
+            ImGui::BulletText("Save / Save As… — write a ProTracker .mod");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.90f, 0.70f, 0.35f, 1.f), "First song recipe");
+            ImGui::TextWrapped(
+                "1. Click New\n"
+                "2. Open Sample (F10) → Load… a WAV into slot 01\n"
+                "3. Switch to Pattern (F9), keep Edit on\n"
+                "4. Press Z / X / C … or Q / W / E … to place notes\n"
+                "5. Space to play  ·  Save As… when happy");
+            ImGui::Spacing();
+            ImGui::TextDisabled("H toggles this window  ·  P options  ·  Esc quits "
+                                "(or stops sample preview)");
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Pattern")) {
+            ImGui::TextWrapped(
+                "Click a cell to move the cursor. With Edit on, the keyboard writes into "
+                "the current pattern.");
+            ImGui::Spacing();
+            if (ImGui::BeginTable("patkeys", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Keys", ImGuiTableColumnFlags_WidthFixed, 200.f);
+                ImGui::TableSetupColumn("Action");
+                ImGui::TableHeadersRow();
+                auto row = [](const char* k, const char* a) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(k);
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", a);
+                };
+                row("Z S X D C V G B H N J M", "Notes at current octave");
+                row("Q 2 W 3 E R 5 T 6 Y 7 U I", "Notes one octave up");
+                row("Arrows / Tab", "Move cursor / note·instr·fx·param");
+                row("0-9 A-F", "Hex digits on instr / effect / param");
+                row("Del / Backspace", "Clear cell (or selection)");
+                row("Shift+Arrows", "Block select");
+                row("Ctrl+C / X / V", "Copy / cut / paste block");
+                row("Ctrl+Z / Y", "Undo / redo");
+                row("Oct / Ins / Step", "Toolbar: octave, instrument, row step");
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+            ImGui::TextWrapped(
+                "Orders strip: click to jump. Right-click an order to change pattern index, "
+                "insert, or delete. +Ord appends an order. New Pat adds an empty pattern.");
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Samples")) {
+            ImGui::TextWrapped(
+                "F10 opens the sample editor. Pick a slot (01–31), load audio, set loop "
+                "points, then use that instrument number in the pattern.");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.90f, 0.70f, 0.35f, 1.f), "Load / save");
+            ImGui::BulletText("Load… — WAV, IFF 8SVX, or RAW 8-bit");
+            ImGui::BulletText("From MOD… — copy instrument from another module (Steal#)");
+            ImGui::BulletText("RAW unsigned — treat raw bytes as 0–255 PCM");
+            ImGui::BulletText("Save WAV / 8SVX / RAW — export the current slot");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.90f, 0.70f, 0.35f, 1.f), "Waveform");
+            ImGui::BulletText("Click-drag on the wave to select a range");
+            ImGui::BulletText("Green lines mark the loop (repstart / replen)");
+            ImGui::BulletText("Loop Sel — loop = selection; No Loop — one-shot");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.90f, 0.70f, 0.35f, 1.f), "Ops (undoable)");
+            ImGui::TextWrapped(
+                "Cut Copy Paste Clear Crop · Reverse Invert Boost Filter · Fade In/Out · "
+                "Amplify · Oct− / Oct+ (resample)");
+            ImGui::Spacing();
+            ImGui::TextWrapped(
+                "Audition: on the Sample page, press piano keys to preview the selected "
+                "slot without changing the pattern. Esc stops the preview.");
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Playback")) {
+            if (ImGui::BeginTable("playkeys", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Keys", ImGuiTableColumnFlags_WidthFixed, 160.f);
+                ImGui::TableSetupColumn("Action");
+                ImGui::TableHeadersRow();
+                auto row = [](const char* k, const char* a) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(k);
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", a);
+                };
+                row("Space", "Play / pause");
+                row("R", "Restart from beginning");
+                row("Play from cursor", "Jump playhead to edit row");
+                row("← → (Edit off)", "Seek previous / next order");
+                row("F1–F8", "Mute / unmute channel");
+                row("U", "Unmute all");
+                row("Ctrl+N / Ctrl+S", "New song / Save");
+                row("O", "Open file browser");
+                row("P", "Options (display + WAV/note export)");
+                row("H", "This help page");
+                row("Esc", "Stop audition, or quit");
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+            ImGui::TextWrapped(
+                "Options → Render WAV bounces the song offline. Render Notes dumps patterns "
+                "(or SMUS events) to a text file.");
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Formats")) {
+            if (ImGui::BeginTable("fmts", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Format");
+                ImGui::TableSetupColumn("Play");
+                ImGui::TableSetupColumn("Edit / save");
+                ImGui::TableHeadersRow();
+                auto row = [](const char* f, const char* p, const char* e) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(f);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(p);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(e);
+                };
+                row(".mod (M.K. / FLT4 / …)", "yes", "yes → Save as .mod");
+                row("MMD0–3 (OctaMED)", "yes", "edit → export .mod");
+                row(".smus (Sonix)", "yes", "play only");
+                row(".hsq packed mod", "yes", "—");
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+            ImGui::TextWrapped(
+                "Effects supported in playback: arpeggio (0), porta (1/2), tone porta (3), "
+                "volume (C), break (D), jump (B), speed/tempo (F).");
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
 }
 
 static void draw_options_window(App& app, SDL_AudioDeviceID adev, AudioBridge& bridge) {
@@ -657,7 +1148,8 @@ int main(int argc, char** argv) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // Tracker owns arrows / letters; don't let ImGui nav steal them.
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     apply_style();
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
@@ -701,6 +1193,71 @@ int main(int argc, char** argv) {
                 app.pending_load = selection[0];
             }
         }
+        if (app.pending_save && app.pending_save->ready()) {
+            auto path = app.pending_save->result();
+            app.pending_save.reset();
+            if (!path.empty()) {
+                app.pending_save_path = path;
+            }
+        }
+        if (app.pending_sample_open && app.pending_sample_open->ready()) {
+            auto selection = app.pending_sample_open->result();
+            app.pending_sample_open.reset();
+            if (!selection.empty()) {
+                app.pending_sample_load = selection[0];
+            }
+        }
+        if (app.pending_sample_save && app.pending_sample_save->ready()) {
+            auto path = app.pending_sample_save->result();
+            app.pending_sample_save.reset();
+            if (!path.empty()) {
+                app.pending_sample_save_path = path;
+            }
+        }
+        if (!app.pending_save_path.empty() && app.player) {
+            const fs::path path = app.pending_save_path;
+            app.pending_save_path.clear();
+            app.save_to(path);
+        }
+        if (!app.pending_sample_load.empty() && app.player) {
+            const fs::path path = app.pending_sample_load;
+            app.pending_sample_load.clear();
+            try {
+                mod::Sample s;
+                if (app.pending_steal_mod) {
+                    s = mod::load_sample_from_mod(path, app.editor.steal_instr);
+                } else {
+                    s = mod::load_sample_file(path, app.editor.raw_unsigned);
+                }
+                app.editor.replace_sample(app.player->module(), app.player->mutex(),
+                                          app.editor.sample_slot, std::move(s));
+                app.sync_sample_name_buf();
+                app.status = "loaded sample " + path.string();
+            } catch (const std::exception& ex) {
+                app.status = std::string("sample load failed: ") + ex.what();
+            }
+        }
+        if (!app.pending_sample_save_path.empty() && app.player) {
+            const fs::path path = app.pending_sample_save_path;
+            app.pending_sample_save_path.clear();
+            try {
+                mod::Sample s;
+                {
+                    std::lock_guard lock(app.player->mutex());
+                    s = app.editor.current_sample(app.player->module());
+                }
+                if (app.pending_sample_save_fmt == 1) {
+                    mod::save_sample_8svx(s, path);
+                } else if (app.pending_sample_save_fmt == 2) {
+                    mod::save_sample_raw(s, path);
+                } else {
+                    mod::save_sample_wav(s, path);
+                }
+                app.status = "saved sample " + path.string();
+            } catch (const std::exception& ex) {
+                app.status = std::string("sample save failed: ") + ex.what();
+            }
+        }
         if (!app.pending_load.empty()) {
             const fs::path path = app.pending_load;
             app.pending_load.clear();
@@ -721,14 +1278,37 @@ int main(int argc, char** argv) {
             if (e.type == SDL_QUIT) {
                 running = false;
             }
-            if (e.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
+            // Only yield keys while typing in an ImGui text field. WantCaptureKeyboard is
+            // almost always true (focused buttons/selectables) and was blocking the editor.
+            if (e.type == SDL_KEYDOWN && !io.WantTextInput) {
                 const SDL_Keycode k = e.key.keysym.sym;
+                const bool ctrl = (e.key.keysym.mod & KMOD_CTRL) != 0;
+                const bool shift = (e.key.keysym.mod & KMOD_SHIFT) != 0;
                 if (k == SDLK_ESCAPE) {
-                    running = false;
-                } else if (k == SDLK_o) {
+                    if (app.player && app.player->auditioning()) {
+                        app.player->stop_audition();
+                    } else {
+                        running = false;
+                    }
+                } else if (k == SDLK_o && !ctrl) {
                     app.begin_browse();
-                } else if (k == SDLK_p) {
+                } else if (k == SDLK_n && ctrl && !app.smus) {
+                    SDL_LockAudioDevice(adev);
+                    bridge.player = nullptr;
+                    bridge.smus = nullptr;
+                    SDL_UnlockAudioDevice(adev);
+                    app.new_song();
+                    apply_loaded_module();
+                } else if (k == SDLK_s && ctrl && app.player) {
+                    if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr) {
+                        app.save_to(app.open_path);
+                    } else {
+                        app.begin_save_as();
+                    }
+                } else if (k == SDLK_p && !ctrl) {
                     app.show_options = !app.show_options;
+                } else if (k == SDLK_h && !ctrl) {
+                    app.show_help = !app.show_help;
                 } else if (app.smus) {
                     if (k == SDLK_SPACE) {
                         app.smus->set_playing(!app.smus->playing());
@@ -737,21 +1317,61 @@ int main(int argc, char** argv) {
                         app.flash = 0.4f;
                     }
                 } else if (app.player) {
-                    if (k == SDLK_SPACE) {
+                    auto& ed = app.editor;
+                    if (ctrl && k == SDLK_z) {
+                        ed.undo(app.player->module(), app.player->mutex());
+                    } else if (ctrl && k == SDLK_y) {
+                        ed.redo(app.player->module(), app.player->mutex());
+                    } else if (ctrl && k == SDLK_c && ed.view == mod::EditorView::Pattern) {
+                        ed.copy_block(app.player->module());
+                    } else if (ctrl && k == SDLK_x && ed.view == mod::EditorView::Pattern) {
+                        ed.cut_block(app.player->module(), app.player->mutex());
+                    } else if (ctrl && k == SDLK_v && ed.view == mod::EditorView::Pattern) {
+                        ed.paste_block(app.player->module(), app.player->mutex());
+                    } else if (k == SDLK_F9) {
+                        ed.view = mod::EditorView::Pattern;
+                    } else if (k == SDLK_F10) {
+                        ed.view = mod::EditorView::Sample;
+                        app.sync_sample_name_buf();
+                    } else if (k == SDLK_SPACE) {
                         app.player->set_playing(!app.player->playing());
-                    } else if (k == SDLK_r) {
+                    } else if (k == SDLK_r && !ctrl) {
                         app.player->restart();
                         app.flash = 0.4f;
-                    } else if (k == SDLK_LEFT) {
+                    } else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
+                        if (ed.view == mod::EditorView::Pattern && ed.edit_mode) {
+                            if (ed.has_sel) {
+                                ed.clear_block(app.player->module(), app.player->mutex());
+                            } else {
+                                ed.clear_cell(app.player->module(), app.player->mutex());
+                            }
+                        }
+                    } else if (ed.edit_mode &&
+                               ed.handle_nav_key(app.player->module(), int(k), shift)) {
+                        // cursor / field move
+                    } else if (k == SDLK_LEFT && !ed.edit_mode) {
                         app.player->seek_order(-1);
                         app.flash = 0.3f;
-                    } else if (k == SDLK_RIGHT) {
+                    } else if (k == SDLK_RIGHT && !ed.edit_mode) {
                         app.player->seek_order(1);
                         app.flash = 0.3f;
                     } else if (k >= SDLK_F1 && k <= SDLK_F8) {
                         app.player->toggle_mute(k - SDLK_F1);
                     } else if (k == SDLK_u) {
                         app.player->unmute_all();
+                    } else {
+                        int period = 0;
+                        const int key =
+                            (k >= 0 && k < 256) ? int(std::tolower(char(k))) : int(k);
+                        if (ed.handle_note_key(app.player->module(), app.player->mutex(), key, shift,
+                                               &period)) {
+                            if (period) {
+                                const int ins = (ed.view == mod::EditorView::Sample)
+                                                    ? (ed.sample_slot + 1)
+                                                    : ed.instrument;
+                                app.player->audition(ins, period);
+                            }
+                        }
                     }
                 }
             }
@@ -790,15 +1410,26 @@ int main(int argc, char** argv) {
                                 snap.magic.empty() ? "—" : snap.magic.c_str());
         }
         ImGui::SameLine();
-        const float opts_w = ImGui::CalcTextSize("Options").x + ImGui::GetStyle().FramePadding.x * 2.f;
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - opts_w - ImGui::GetStyle().WindowPadding.x);
-        if (ImGui::SmallButton("Options")) {
-            app.show_options = !app.show_options;
+        {
+            const float help_w =
+                ImGui::CalcTextSize("Help").x + ImGui::GetStyle().FramePadding.x * 2.f;
+            const float opts_w =
+                ImGui::CalcTextSize("Options").x + ImGui::GetStyle().FramePadding.x * 2.f;
+            const float gap = ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SetCursorPosX(ImGui::GetWindowWidth() - help_w - opts_w - gap -
+                                 ImGui::GetStyle().WindowPadding.x);
+            if (ImGui::SmallButton("Help")) {
+                app.show_help = !app.show_help;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Options")) {
+                app.show_options = !app.show_options;
+            }
         }
 
         ImGui::Separator();
 
-        ImGui::SetNextItemWidth(520);
+        ImGui::SetNextItemWidth(420);
         ImGui::InputText("##open", app.open_path, sizeof(app.open_path));
         ImGui::SameLine();
         if (ImGui::Button("Browse...")) {
@@ -808,13 +1439,38 @@ int main(int argc, char** argv) {
         if (ImGui::Button("Open") && app.open_path[0]) {
             app.request_open_typed();
         }
+        ImGui::SameLine();
+        if (ImGui::Button("New")) {
+            SDL_LockAudioDevice(adev);
+            bridge.player = nullptr;
+            bridge.smus = nullptr;
+            SDL_UnlockAudioDevice(adev);
+            app.new_song();
+            apply_loaded_module();
+        }
+        if (app.player) {
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) {
+                if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr &&
+                    fs::path(app.open_path).extension() == ".mod") {
+                    app.save_to(app.open_path);
+                } else {
+                    app.begin_save_as();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save As…")) {
+                app.begin_save_as();
+            }
+        }
 
         ImGui::Separator();
 
         if (!app.has_song()) {
             ImGui::TextWrapped("%s", app.status.c_str());
-            ImGui::TextDisabled("O / Browse...  ·  P options  ·  Esc quit");
+            ImGui::TextDisabled("New  ·  O open  ·  H help  ·  P options  ·  Esc quit");
             ImGui::End();
+            draw_help_window(app);
             draw_options_window(app, adev, bridge);
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
@@ -850,7 +1506,7 @@ int main(int argc, char** argv) {
                 ImGui::ProgressBar(n ? prog / float(n) : 0.f, ImVec2(-1, 10), "");
             }
 
-            ImGui::TextDisabled("Space  ·  R restart  ·  O open  ·  P options");
+            ImGui::TextDisabled("Space  ·  R restart  ·  O open  ·  H help  ·  P options");
             ImGui::TextWrapped("%s", app.status.c_str());
 
             const int chn = std::max(1, std::min(4, ssnap.tracks));
@@ -955,6 +1611,7 @@ int main(int argc, char** argv) {
             ImGui::EndChild();
 
             ImGui::End();
+            draw_help_window(app);
             draw_options_window(app, adev, bridge);
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
@@ -980,9 +1637,14 @@ int main(int argc, char** argv) {
             app.player->seek_order(1);
         }
         ImGui::SameLine();
-        ImGui::Text("%s   ORD %02d/%02d   PAT %02d   ROW %02d   TICK %d/%d   TEMPO %d",
-                    snap.title.c_str(), snap.order_pos, snap.song_length, snap.pattern_index,
-                    snap.row, snap.tick, snap.speed, snap.tempo);
+        if (ImGui::Button("Play from cursor")) {
+            app.player->seek_row(snap.order_pos, app.editor.row);
+            app.player->set_playing(true);
+        }
+        ImGui::SameLine();
+        ImGui::Text("%s%s   ORD %02d/%02d   PAT %02d   ROW %02d   TICK %d/%d   TEMPO %d",
+                    app.editor.dirty ? "*" : "", snap.title.c_str(), snap.order_pos, snap.song_length,
+                    snap.pattern_index, snap.row, snap.tick, snap.speed, snap.tempo);
 
         {
             const int rows = snap.pattern.empty() ? mod::kRows : int(snap.pattern.size());
@@ -991,8 +1653,46 @@ int main(int argc, char** argv) {
             ImGui::ProgressBar(cur / total, ImVec2(-1, 10), "");
         }
 
+        // Editor toolbar
+        {
+            auto& ed = app.editor;
+            ImGui::SetNextItemWidth(160);
+            if (ImGui::InputText("Title", ed.title_buf, sizeof(ed.title_buf))) {
+                std::lock_guard lock(app.player->mutex());
+                app.player->module().title = ed.title_buf;
+                ed.mark_dirty();
+            }
+            ImGui::SameLine();
+            ImGui::Checkbox("Edit", &ed.edit_mode);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Pattern", ed.view == mod::EditorView::Pattern)) {
+                ed.view = mod::EditorView::Pattern;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Sample", ed.view == mod::EditorView::Sample)) {
+                ed.view = mod::EditorView::Sample;
+                app.sync_sample_name_buf();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            ImGui::DragInt("Oct", &ed.octave, 1, 1, 3);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            ImGui::DragInt("Ins", &ed.instrument, 1, 1, 31);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            ImGui::DragInt("Step", &ed.step, 1, 0, 16);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Undo") && ed.undo(app.player->module(), app.player->mutex())) {
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Redo") && ed.redo(app.player->module(), app.player->mutex())) {
+            }
+        }
+
         ImGui::TextDisabled(
-            "O open  ·  P options  ·  Space  ·  Left/Right order  ·  F1-F8 mute  ·  U unmute  ·  R restart");
+            "F9 Pattern  ·  F10 Sample  ·  Ctrl+N/S  ·  Z/Q piano  ·  Del clear  ·  Ctrl+Z/Y  ·  "
+            "Space  ·  H help  ·  P options");
         ImGui::TextWrapped("%s", app.status.c_str());
 
         const int chn = snap.channels;
@@ -1054,54 +1754,117 @@ int main(int argc, char** argv) {
         }
 
         ImGui::Separator();
-        ImGui::Text("PATTERN #%02d", snap.pattern_index);
-        const int pat_rows = snap.pattern.empty() ? 0 : int(snap.pattern.size());
-        const int visible = std::min(app.zoom_rows, std::max(1, pat_rows));
-        const int start =
-            std::clamp(snap.row - visible / 2, 0, std::max(0, pat_rows - visible));
-        if (ImGui::BeginTable("pat", 1 + chn,
-                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_ScrollY,
-                              ImVec2(-1, 320))) {
-            ImGui::TableSetupColumn("ROW", ImGuiTableColumnFlags_WidthFixed, 40);
-            for (int c = 0; c < chn; ++c) {
-                char hd[8];
-                std::snprintf(hd, sizeof(hd), "CH%d", c);
-                ImGui::TableSetupColumn(hd);
+
+        if (app.editor.view == mod::EditorView::Sample) {
+            ImGui::Text("SAMPLE EDITOR");
+            draw_sample_editor(app);
+        } else {
+            auto& ed = app.editor;
+            // Sync edit pattern index with playhead when not editing
+            if (!ed.edit_mode) {
+                ed.pat = snap.pattern_index;
+                ed.row = snap.row;
             }
-            ImGui::TableHeadersRow();
-            for (int vi = 0; vi < visible; ++vi) {
-                const int row = start + vi;
-                if (row >= pat_rows) {
-                    break;
+
+            std::vector<std::vector<mod::Note>> pat_view;
+            {
+                std::lock_guard lock(app.player->mutex());
+                ed.ensure_pattern(app.player->module(), ed.pat);
+                if (ed.pat >= 0 && ed.pat < app.player->module().pattern_count()) {
+                    pat_view = app.player->module().patterns[size_t(ed.pat)];
                 }
-                ImGui::TableNextRow();
-                const bool cur = row == snap.row;
-                if (cur) {
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                                          IM_COL32(180 + int(app.flash * 70), 50, 25, 255));
+            }
+
+            ImGui::Text("PATTERN #%02d  cursor R%02d C%d", ed.pat, ed.row, ed.ch);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("New Pat")) {
+                ed.pat = ed.add_pattern(app.player->module(), app.player->mutex());
+            }
+
+            const int pat_rows = pat_view.empty() ? 0 : int(pat_view.size());
+            const int focus_row = ed.edit_mode ? ed.row : snap.row;
+            const int visible = std::min(app.zoom_rows, std::max(1, pat_rows));
+            const int start =
+                std::clamp(focus_row - visible / 2, 0, std::max(0, pat_rows - visible));
+
+            // Selection bounds
+            int sr0 = ed.sel_row0, sr1 = ed.sel_row1, sc0 = ed.sel_ch0, sc1 = ed.sel_ch1;
+            if (ed.has_sel) {
+                if (sr1 < sr0) {
+                    std::swap(sr0, sr1);
                 }
-                ImGui::TableSetColumnIndex(0);
-                ImGui::Text("%02d", row);
-                if (row < int(snap.pattern.size())) {
-                    for (int c = 0; c < chn && c < int(snap.pattern[size_t(row)].size()); ++c) {
-                        ImGui::TableSetColumnIndex(c + 1);
-                        const auto& note = snap.pattern[size_t(row)][size_t(c)];
-                        if (cur) {
-                            ImGui::TextUnformatted(note.text().c_str());
-                        } else {
-                            ImGui::TextColored(ch_color(c), "%s", note.text().c_str());
+                if (sc1 < sc0) {
+                    std::swap(sc0, sc1);
+                }
+            }
+
+            if (ImGui::BeginTable("pat", 1 + chn,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_ScrollY,
+                                  ImVec2(-1, 280))) {
+                ImGui::TableSetupColumn("ROW", ImGuiTableColumnFlags_WidthFixed, 40);
+                for (int c = 0; c < chn; ++c) {
+                    char hd[8];
+                    std::snprintf(hd, sizeof(hd), "CH%d", c);
+                    ImGui::TableSetupColumn(hd);
+                }
+                ImGui::TableHeadersRow();
+                for (int vi = 0; vi < visible; ++vi) {
+                    const int row = start + vi;
+                    if (row >= pat_rows) {
+                        break;
+                    }
+                    ImGui::TableNextRow();
+                    const bool play_row = row == snap.row && ed.pat == snap.pattern_index;
+                    if (play_row) {
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                              IM_COL32(180 + int(app.flash * 70), 50, 25, 255));
+                    }
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%02d", row);
+                    if (row < int(pat_view.size())) {
+                        for (int c = 0; c < chn && c < int(pat_view[size_t(row)].size()); ++c) {
+                            ImGui::TableSetColumnIndex(c + 1);
+                            const auto& note = pat_view[size_t(row)][size_t(c)];
+                            const bool cur = ed.edit_mode && row == ed.row && c == ed.ch;
+                            const bool in_sel =
+                                ed.has_sel && row >= sr0 && row <= sr1 && c >= sc0 && c <= sc1;
+                            if (in_sel) {
+                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
+                                                      IM_COL32(90, 50, 20, 180));
+                            }
+                            if (cur) {
+                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
+                                                      IM_COL32(200, 110, 30, 220));
+                            }
+                            char label[32];
+                            std::snprintf(label, sizeof(label), "%s##r%dc%d", note.text().c_str(),
+                                          row, c);
+                            if (ImGui::Selectable(label, cur, ImGuiSelectableFlags_AllowDoubleClick)) {
+                                ed.row = row;
+                                ed.ch = c;
+                                ed.pat = ed.pat;
+                                if (ImGui::GetIO().KeyShift) {
+                                    ed.update_sel_to_cursor();
+                                } else {
+                                    ed.has_sel = false;
+                                }
+                            }
+                            if (!cur) {
+                                // Selectable already drew text; colour via style when not current
+                            }
                         }
                     }
                 }
+                ImGui::EndTable();
             }
-            ImGui::EndTable();
         }
 
         if (app.view.show_orders) {
             ImGui::Separator();
             ImGui::Text("ORDERS");
-            ImGui::BeginChild("orders", ImVec2(0, 40), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("orders", ImVec2(0, 52), false, ImGuiWindowFlags_HorizontalScrollbar);
+            auto& ed = app.editor;
             for (int i = 0; i < snap.song_length; ++i) {
                 if (i) {
                     ImGui::SameLine();
@@ -1119,14 +1882,34 @@ int main(int argc, char** argv) {
                 ImGui::PushID(i);
                 if (ImGui::SmallButton(lab)) {
                     app.player->seek_order(i - snap.order_pos);
+                    ed.pat = pat;
+                }
+                if (ImGui::BeginPopupContextItem("ordctx")) {
+                    int p = pat;
+                    if (ImGui::InputInt("Pattern", &p)) {
+                        ed.set_order_pattern(app.player->module(), app.player->mutex(), i,
+                                             std::max(0, p));
+                    }
+                    if (ImGui::MenuItem("Insert after")) {
+                        ed.insert_order(app.player->module(), app.player->mutex(), i + 1);
+                    }
+                    if (ImGui::MenuItem("Delete")) {
+                        ed.delete_order(app.player->module(), app.player->mutex(), i);
+                    }
+                    ImGui::EndPopup();
                 }
                 ImGui::PopID();
                 ImGui::PopStyleColor();
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+Ord")) {
+                ed.insert_order(app.player->module(), app.player->mutex(), snap.song_length);
             }
             ImGui::EndChild();
         }
 
         ImGui::End();
+        draw_help_window(app);
         draw_options_window(app, adev, bridge);
         ImGui::Render();
         SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);

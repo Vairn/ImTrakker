@@ -11,7 +11,7 @@
         {
             "label": "CMake: build Debug",
             "type": "shell",
-            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config Debug --target imtrakker -j",
+            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config Debug --target imtrakker",
             "group": {
                 "kind": "build",
                 "isDefault": true
@@ -22,7 +22,7 @@
         {
             "label": "CMake: build Release",
             "type": "shell",
-            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config Release --target imtrakker -j",
+            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config Release --target imtrakker",
             "group": "build",
             "problemMatcher": "$msCompile",
             "detail": "Build imtrakker (Release)"
@@ -30,7 +30,7 @@
         {
             "label": "CMake: build RelWithDebInfo",
             "type": "shell",
-            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config RelWithDebInfo --target imtrakker -j",
+            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config RelWithDebInfo --target imtrakker",
             "group": "build",
             "problemMatcher": "$msCompile",
             "detail": "Build imtrakker (RelWithDebInfo)"
@@ -38,7 +38,7 @@
         {
             "label": "CMake: build MinSizeRel",
             "type": "shell",
-            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config MinSizeRel --target imtrakker -j",
+            "command": "cmake --build \"${workspaceFolder}/build/x64\" --config MinSizeRel --target imtrakker",
             "group": "build",
             "problemMatcher": "$msCompile",
             "detail": "Build imtrakker (MinSizeRel)"

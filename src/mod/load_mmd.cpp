@@ -118,17 +118,17 @@ Module load_mmd(std::vector<uint8_t> data, std::filesystem::path path) {
                     nbytes = nbytes / size_t(std::max(1, octs));
                 }
                 smp.length_words = int(nbytes / 2);
-                smp.data = pcm_from_bytes(data.data() + off + 6, nbytes);
+                smp.wave = pcm_from_bytes(data.data() + off + 6, nbytes);
                 if (smp.replen_words <= 1) {
                     smp.replen_words = 0;
                 }
             } else {
                 // synth/hybrid — generate a short tone so notes still speak
-                smp.data.assign(256, 0.f);
-                for (size_t n = 0; n < smp.data.size(); ++n) {
-                    smp.data[n] = (n & 32) ? 0.25f : -0.25f;
+                smp.wave.assign(256, 0.f);
+                for (size_t n = 0; n < smp.wave.size(); ++n) {
+                    smp.wave[n] = (n & 32) ? 0.25f : -0.25f;
                 }
-                smp.length_words = int(smp.data.size() / 2);
+                smp.length_words = int(smp.wave.size() / 2);
                 smp.replen_words = smp.length_words;
             }
         }

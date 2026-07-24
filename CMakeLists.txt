@@ -33,6 +33,10 @@ add_executable(imtrakker
     src/mod/module.cpp
     src/mod/load_mmd.cpp
     src/mod/player.cpp
+    src/mod/save_mod.cpp
+    src/mod/editor.cpp
+    src/mod/sample_io.cpp
+    src/mod/sample_edit.cpp
     src/smus/smus_load.cpp
     src/smus/smus_engine.cpp
     ${IMGUI_DIR}/imgui.cpp
@@ -58,11 +62,25 @@ target_link_libraries(imtrakker PRIVATE
 if(WIN32)
     # portable-file-dialogs (IFileDialog / GetOpenFileName)
     target_link_libraries(imtrakker PRIVATE comdlg32 ole32 uuid shell32)
+
+    # Emit SDL2*.dll into the same config folder as imtrakker.exe (Debug/Release/…).
+    # Avoids a post-build copy race where F5 launches before the DLL lands beside the exe
+    # (Windows error 0xc0000135 STATUS_DLL_NOT_FOUND).
+    set_target_properties(SDL2 PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/MinSizeRel"
+    )
+
+    # Belt-and-suspenders: still copy after link (covers odd multi-config layouts).
     add_custom_command(TARGET imtrakker POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:SDL2::SDL2>
-            $<TARGET_FILE_DIR:imtrakker>
-        COMMENT "Copy SDL2.dll next to imtrakker"
+            "$<TARGET_FILE:SDL2::SDL2>"
+            "$<TARGET_FILE_DIR:imtrakker>"
+        COMMENT "Ensure SDL2 DLL is next to imtrakker"
+        VERBATIM
     )
 endif()
 

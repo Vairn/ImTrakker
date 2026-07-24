@@ -61,6 +61,42 @@ void Player::seek_order(int delta) {
     row_event_ = true;
 }
 
+void Player::seek_row(int order, int row) {
+    std::lock_guard lock(mutex_);
+    if (module_.song_length <= 0) {
+        return;
+    }
+    order_pos_ = std::clamp(order, 0, module_.song_length - 1);
+    const int pat = module_.orders[size_t(order_pos_)];
+    const int pat_rows =
+        (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size()) : kRows;
+    row_ = std::clamp(row, 0, std::max(0, pat_rows - 1));
+    tick_ = 0;
+    pattern_break_ = -1;
+    pattern_jump_ = -1;
+    tick_left_ = 0;
+    row_event_ = true;
+}
+
+void Player::audition(int instrument_1based, int period) {
+    std::lock_guard lock(mutex_);
+    if (instrument_1based < 1 || instrument_1based > int(module_.samples.size()) || period <= 0) {
+        audition_active_ = false;
+        return;
+    }
+    audition_sample_ = &module_.samples[size_t(instrument_1based - 1)];
+    audition_pos_ = 0.0;
+    audition_period_ = period;
+    audition_volume_ = std::clamp(audition_sample_->volume, 0, 64);
+    audition_active_ = true;
+}
+
+void Player::stop_audition() {
+    std::lock_guard lock(mutex_);
+    audition_active_ = false;
+    audition_sample_ = nullptr;
+}
+
 void Player::toggle_mute(int ch) {
     std::lock_guard lock(mutex_);
     if (ch >= 0 && ch < int(channels_.size())) {
@@ -246,7 +282,7 @@ void Player::mix(float* left, float* right, int n) {
         }
 
         const Sample& samp = *ch.sample;
-        const auto& data = samp.data;
+        const auto& data = samp.wave;
         const int length = int(data.size());
         if (length < 2) {
             continue;
@@ -328,31 +364,82 @@ void Player::mix(float* left, float* right, int n) {
     }
 }
 
+void Player::mix_audition(float* left, float* right, int n) {
+    if (!audition_active_ || !audition_sample_ || audition_period_ <= 0) {
+        return;
+    }
+    const Sample& samp = *audition_sample_;
+    const auto& data = samp.wave;
+    const int length = int(data.size());
+    if (length < 2) {
+        audition_active_ = false;
+        return;
+    }
+    const double step = (kPaulaClock / double(audition_period_)) / double(kSampleRate);
+    const float vol = audition_volume_ / 64.f * 0.45f;
+    const double rep_start = double(samp.repstart_words * 2);
+    const double rep_len = double(samp.replen_words * 2);
+    const bool looping = rep_len > 2.0;
+    const double loop_end = rep_start + rep_len;
+    double pos = audition_pos_;
+    bool alive = false;
+    for (int i = 0; i < n; ++i) {
+        float v = 0.f;
+        if (looping) {
+            if (pos >= loop_end) {
+                pos = rep_start + std::fmod(pos - rep_start, rep_len);
+            }
+            const int idx = int(pos);
+            if (idx >= 0 && idx < length) {
+                v = data[size_t(idx)] * vol;
+                alive = true;
+            }
+        } else if (pos < length) {
+            v = data[size_t(int(pos))] * vol;
+            alive = true;
+        }
+        left[i] += v;
+        right[i] += v;
+        pos += step;
+    }
+    if (looping) {
+        if (pos >= loop_end) {
+            pos = rep_start + std::fmod(pos - rep_start, rep_len);
+        }
+        audition_pos_ = pos;
+    } else {
+        audition_pos_ = pos;
+        if (!alive || pos >= length) {
+            audition_active_ = false;
+        }
+    }
+}
+
 void Player::render(float* interleaved_stereo, int n_frames) {
     std::fill(interleaved_stereo, interleaved_stereo + n_frames * 2, 0.f);
-    if (!playing_) {
-        return;
-    }
     std::lock_guard lock(mutex_);
-    if (!playing_) {
-        return;
-    }
 
     std::vector<float> left(static_cast<size_t>(n_frames), 0.f);
     std::vector<float> right(static_cast<size_t>(n_frames), 0.f);
-    int write = 0;
-    int remaining = n_frames;
-    while (remaining > 0 && playing_) {
-        if (tick_left_ <= 0) {
-            process_tick();
-            tick_left_ = samples_per_tick();
+
+    if (playing_) {
+        int write = 0;
+        int remaining = n_frames;
+        while (remaining > 0 && playing_) {
+            if (tick_left_ <= 0) {
+                process_tick();
+                tick_left_ = samples_per_tick();
+            }
+            const int n = std::min(remaining, tick_left_);
+            mix(left.data() + write, right.data() + write, n);
+            write += n;
+            remaining -= n;
+            tick_left_ -= n;
         }
-        const int n = std::min(remaining, tick_left_);
-        mix(left.data() + write, right.data() + write, n);
-        write += n;
-        remaining -= n;
-        tick_left_ -= n;
     }
+
+    mix_audition(left.data(), right.data(), n_frames);
+
     for (int i = 0; i < n_frames; ++i) {
         interleaved_stereo[i * 2] = left[size_t(i)];
         interleaved_stereo[i * 2 + 1] = right[size_t(i)];

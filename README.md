@@ -1,10 +1,19 @@
 # ImTrakker
 
-Amiga ProTracker / Startrekker module player with an **SDL2 + Dear ImGui** UI.
+Amiga ProTracker / Startrekker **player and editor** with an **SDL2 + Dear ImGui** UI.
 
-Built as a sibling project to the [Dune Amiga](../Amiga/Dune) reverse-engineering tree. Default playlist points at Dune’s ripped FLT4 songs (`m1` / `m2` / `m3`); you can also open arbitrary supported modules.
+Built as a sibling project to the [Dune Amiga](../Amiga/Dune) reverse-engineering tree. Open existing modules or **New** a blank song, edit patterns/samples, and **Save** as `.mod`.
 
-## Supported magics (@1080)
+## Supported formats
+
+| Format | Play | Edit / Save |
+|--------|------|-------------|
+| ProTracker / Startrekker (`.mod`) | yes | yes (save as `.mod`) |
+| OctaMED MMD0–3 | yes | edit in memory → save as `.mod` |
+| Sonix SMUS | yes | play-only |
+| HSQ-packed mods | yes (unpack) | — |
+
+### Magics (@1080)
 
 | Magic | Channels |
 |-------|----------|
@@ -13,7 +22,7 @@ Built as a sibling project to the [Dune Amiga](../Amiga/Dune) reverse-engineerin
 | `6CHN` | 6 |
 | `8CHN` / `FLT8` | 8 |
 
-Effect subset matches `Dune/tools/play_tracker.py` (arpeggio, porta, volume, speed/tempo, break/jump).
+Effect subset: arpeggio, porta, volume, speed/tempo, break/jump.
 
 ## Build (Windows / MSYS2 UCRT64)
 
@@ -27,19 +36,52 @@ Requires **SDL2** (and a C++17 compiler). Dear ImGui is pulled via CMake FetchCo
 ## Run
 
 ```bash
-# Uses ../Amiga/Dune/ripped if present, or set IMTRAKKER_DATA / DUNE_DATA
 ./build/imtrakker.exe
-./build/imtrakker.exe m2
 ./build/imtrakker.exe path/to/song.mod
 ./build/imtrakker.exe m1 --dump-wav 2 out.wav
 ```
 
-Keys: `1`/`2`/`3` Dune songs · `Space` pause · `←`/`→` order · `F1`–`F8` mute · `R` restart · `O` open file · `Esc` quit
+## Editor
+
+Press **H** or the **Help** button in the app for the full how-to (quick start, pattern keys, samples, playback, formats).
+
+- **New** — blank 4-channel song
+- **Save / Save As…** — ProTracker `.mod`
+- **Pattern** (F9) — click cells, tracker piano keys, effects
+- **Sample** (F10) — waveform, loop, DSP ops, load/save samples
+- **Help** (H) — in-app how-to page
+- **Options** (P) — display + WAV / note export
+
+### Pattern keys
+
+| Key | Action |
+|-----|--------|
+| `Z S X D C V G B H N J M` | Notes (current octave) |
+| `Q 2 W 3 E R 5 T 6 Y 7 U I` | Notes (octave + 1) |
+| Arrows / Tab | Move cursor / field |
+| Digits / `A`–`F` | Instrument / effect / param (hex) |
+| Del | Clear cell / selection |
+| Shift+arrows | Block select |
+| Ctrl+C / X / V | Copy / cut / paste block |
+| Ctrl+Z / Y | Undo / redo |
+| Ctrl+N / S | New / Save |
+| Space | Play / pause |
+| F1–F8 | Mute channels |
+| Esc | Stop sample audition (or quit) |
+
+### Sample formats
+
+Load: **WAV** (PCM), **IFF 8SVX**, **RAW** signed 8-bit (optional unsigned), or steal from another `.mod`.
+
+Save sample: WAV / 8SVX / RAW.
+
+Ops: cut/copy/paste/clear/crop, reverse, invert, amplify, fade, boost, filter, octave resample, set/clear loop. Audition with the same piano keys while on the Sample page.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `src/mod/` | Module loader + Paula-ish mixer |
-| `src/main.cpp` | SDL audio + ImGui tracker UI |
-| `src/hsq.*` | Optional Cryo HSQ unpack (for still-packed `.hsq`) |
+| `src/mod/` | Module load/save, player, editor, sample I/O |
+| `src/smus/` | Sonix SMUS engine (playback) |
+| `src/main.cpp` | SDL audio + ImGui UI |
+| `src/hsq.*` | Optional Cryo HSQ unpack |

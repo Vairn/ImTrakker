@@ -14,6 +14,7 @@
 #include <SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,19 @@ static void apply_style() {
     c[ImGuiCol_TabActive] = ImVec4(0.78f, 0.42f, 0.12f, 1.f);
 }
 
+struct ViewOpts {
+    bool show_scopes = true;
+    bool show_vu = true;
+    bool show_spectrum = true;
+    bool show_orders = true;
+    float meter_height = 56.f;
+    float spectrum_height = 44.f;
+    float render_seconds = 30.f;
+    char render_path[512]{};
+    char note_path[512]{};
+    std::string render_status;
+};
+
 struct App {
     fs::path data_dir;
     std::unique_ptr<mod::Player> player;
@@ -105,6 +120,8 @@ struct App {
     char open_path[512]{};
     int zoom_rows = 14;
     float flash = 0.f;
+    bool show_options = false;
+    ViewOpts view;
     std::shared_ptr<pfd::open_file> pending_open;
     std::string pending_load;
 
@@ -225,6 +242,91 @@ static void dump_wav_smus(smus::Engine& eng, float seconds, const fs::path& out)
     write_wav(out, pcm, eng.sample_rate());
 }
 
+static void dump_notes_mod(const mod::Module& mod, const fs::path& out) {
+    std::ofstream f(out);
+    if (!f) {
+        throw std::runtime_error("cannot write: " + out.string());
+    }
+    f << "ImTrakker note dump\n";
+    f << "Title: " << mod.title << "\n";
+    f << "Format: " << mod.magic << "  Channels: " << mod.channels << "\n";
+    f << "Speed: " << mod.initial_speed << "  Tempo: " << mod.initial_tempo << "\n";
+    f << "Length: " << mod.song_length << "  Restart: " << mod.restart << "\n";
+    f << "Orders:";
+    for (int i = 0; i < mod.song_length && i < int(mod.orders.size()); ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), " %02d", mod.orders[size_t(i)]);
+        f << buf;
+    }
+    f << "\n\n";
+
+    f << "Samples:\n";
+    for (size_t i = 0; i < mod.samples.size(); ++i) {
+        const auto& s = mod.samples[i];
+        if (s.length_words <= 0 && s.name.empty()) {
+            continue;
+        }
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "  %02d  ", int(i + 1));
+        f << buf << s.name << "  len=" << (s.length_words * 2) << "  vol=" << s.volume
+          << "  ft=" << s.finetune << "\n";
+    }
+    f << "\n";
+
+    for (int p = 0; p < mod.pattern_count(); ++p) {
+        const auto& pat = mod.patterns[size_t(p)];
+        char hdr[64];
+        std::snprintf(hdr, sizeof(hdr), "=== PATTERN %02d (%zu rows) ===\n", p, pat.size());
+        f << hdr;
+        for (size_t row = 0; row < pat.size(); ++row) {
+            char rb[8];
+            std::snprintf(rb, sizeof(rb), "%02d |", int(row));
+            f << rb;
+            for (int c = 0; c < mod.channels; ++c) {
+                if (c < int(pat[row].size())) {
+                    f << " " << pat[row][size_t(c)].text() << " |";
+                } else {
+                    f << " --- .. ... |";
+                }
+            }
+            f << "\n";
+        }
+        f << "\n";
+    }
+}
+
+static std::string format_smus_event(const smus::SEvent& ev);
+
+static void dump_notes_smus(const smus::Score& score, float bpm, const fs::path& out) {
+    std::ofstream f(out);
+    if (!f) {
+        throw std::runtime_error("cannot write: " + out.string());
+    }
+    f << "ImTrakker SMUS note dump\n";
+    f << "Title: " << score.name << "\n";
+    f << "BPM: " << int(bpm) << "  Volume: " << score.volume << "\n";
+    f << "Tracks: " << score.tracks.size() << "\n\n";
+
+    f << "Instruments:\n";
+    for (const auto& [reg, name] : score.instruments) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "  %02d  ", reg);
+        f << buf << name << "\n";
+    }
+    f << "\n";
+
+    for (size_t t = 0; t < score.tracks.size(); ++t) {
+        const auto& track = score.tracks[t];
+        f << "=== TRACK " << t << " (" << track.size() << " events) ===\n";
+        for (size_t i = 0; i < track.size(); ++i) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%04d  ", int(i));
+            f << buf << format_smus_event(track[i]) << "\n";
+        }
+        f << "\n";
+    }
+}
+
 static ImVec4 ch_color(int i) {
     static const ImVec4 cols[] = {
         {1.f, 0.73f, 0.36f, 1.f},
@@ -239,34 +341,222 @@ static ImVec4 ch_color(int i) {
     return cols[i & 7];
 }
 
-static void draw_vu(const char* id, float level, float hold, ImVec4 col) {
+// ProTracker-style green → yellow → red LED segment colour (t in [0,1], bottom→top).
+static ImU32 pt_rainbow(float t, bool muted) {
+    t = std::clamp(t, 0.f, 1.f);
+    int r, g, b;
+    if (t < 0.5f) {
+        const float u = t / 0.5f;
+        r = int(255.f * u);
+        g = 220 + int(35.f * u);
+        b = 0;
+    } else {
+        const float u = (t - 0.5f) / 0.5f;
+        r = 255;
+        g = int(255.f * (1.f - u));
+        b = 0;
+    }
+    if (muted) {
+        r = r * 2 / 5;
+        g = g * 2 / 5;
+        b = b * 2 / 5;
+    }
+    return IM_COL32(r, g, b, 255);
+}
+
+// Vertical ProTracker peak meter (segmented LED bars).
+static void draw_vu(const char* id, float level, float hold, bool muted, float height = 56.f) {
     ImGui::PushID(id);
+    const float w = 12.f;
+    const float h = height;
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float w = ImGui::GetContentRegionAvail().x;
-    const float h = 18.f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(36, 24, 16, 255));
-    const int segs = 18;
-    const float gap = 2.f;
-    const float seg_w = (w - (segs - 1) * gap) / segs;
-    const int lit = int(std::lround(std::clamp(level, 0.f, 1.f) * segs));
-    const int hold_seg = int(std::lround(std::clamp(hold, 0.f, 1.f) * segs));
-    for (int i = 0; i < segs; ++i) {
-        const float x = p.x + i * (seg_w + gap);
-        ImU32 c = ImGui::ColorConvertFloat4ToU32(col);
-        if (i >= int(segs * 0.8f)) {
-            c = IM_COL32(255, 90, 40, 255);
-        } else if (i >= int(segs * 0.55f)) {
-            c = IM_COL32(255, 170, 60, 255);
-        }
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(16, 16, 20, 255));
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(48, 48, 56, 255));
+
+    constexpr int kSegs = 16;
+    const float gap = 1.f;
+    const float seg_h = (h - 2.f - (kSegs - 1) * gap) / kSegs;
+    const int lit = int(std::lround(std::clamp(level, 0.f, 1.f) * kSegs));
+    const int hold_seg = int(std::lround(std::clamp(hold, 0.f, 1.f) * kSegs));
+
+    for (int i = 0; i < kSegs; ++i) {
+        const float t = (kSegs <= 1) ? 0.f : float(i) / float(kSegs - 1);
+        const float y = p.y + h - 1.f - (i + 1) * seg_h - i * gap;
+        const ImVec2 a(p.x + 1.f, y);
+        const ImVec2 b(p.x + w - 1.f, y + seg_h);
         if (i < lit) {
-            dl->AddRectFilled(ImVec2(x, p.y + 2), ImVec2(x + seg_w, p.y + h - 2), c);
+            dl->AddRectFilled(a, b, pt_rainbow(t, muted));
         } else if (i == hold_seg - 1 && hold_seg > 0) {
-            dl->AddRectFilled(ImVec2(x, p.y + 2), ImVec2(x + seg_w, p.y + h - 2), IM_COL32(220, 176, 96, 255));
+            dl->AddRectFilled(a, b, pt_rainbow(t, muted));
+        } else {
+            dl->AddRectFilled(a, b, IM_COL32(28, 28, 34, 255));
         }
     }
     ImGui::Dummy(ImVec2(w, h));
     ImGui::PopID();
+}
+
+// Horizontal spectrum strip — crude DFT magnitudes from a mono scope buffer.
+static void draw_spectrum(const char* id, const float* samples, int n, float height = 48.f) {
+    ImGui::PushID(id);
+    constexpr int kBins = 16;
+    float bins[kBins]{};
+    if (samples && n > 0) {
+        for (int bin = 0; bin < kBins; ++bin) {
+            // Skip DC; spread bins across useful spectrum.
+            const float freq = 1.f + float(bin) * 0.55f;
+            float re = 0.f, im = 0.f;
+            for (int i = 0; i < n; ++i) {
+                const float ang = 6.2831853f * freq * float(i) / float(n);
+                re += samples[i] * std::cos(ang);
+                im += samples[i] * std::sin(ang);
+            }
+            bins[bin] = std::sqrt(re * re + im * im) / float(n) * 14.f;
+        }
+    }
+
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = height;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(16, 16, 20, 255));
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(48, 48, 56, 255));
+
+    constexpr int kSegs = 12;
+    const float gap = 2.f;
+    const float bar_w = (w - 2.f - (kBins - 1) * gap) / kBins;
+    const float seg_gap = 1.f;
+    const float seg_h = (h - 2.f - (kSegs - 1) * seg_gap) / kSegs;
+
+    for (int bin = 0; bin < kBins; ++bin) {
+        const int lit = int(std::lround(std::clamp(bins[bin], 0.f, 1.f) * kSegs));
+        const float x = p.x + 1.f + bin * (bar_w + gap);
+        for (int i = 0; i < kSegs; ++i) {
+            const float t = (kSegs <= 1) ? 0.f : float(i) / float(kSegs - 1);
+            const float y = p.y + h - 1.f - (i + 1) * seg_h - i * seg_gap;
+            const ImVec2 a(x, y);
+            const ImVec2 b(x + bar_w, y + seg_h);
+            if (i < lit) {
+                dl->AddRectFilled(a, b, pt_rainbow(t, false));
+            } else {
+                dl->AddRectFilled(a, b, IM_COL32(28, 28, 34, 255));
+            }
+        }
+    }
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::PopID();
+}
+
+static void draw_options_window(App& app, SDL_AudioDeviceID adev, AudioBridge& bridge) {
+    if (!app.show_options) {
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(420, 420), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Options / Render", &app.show_options)) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Scopes", &app.view.show_scopes);
+        ImGui::Checkbox("Rainbow VU meters", &app.view.show_vu);
+        ImGui::Checkbox("Spectrum analyzer", &app.view.show_spectrum);
+        ImGui::Checkbox("Orders strip", &app.view.show_orders);
+        ImGui::SliderInt("Pattern zoom (rows)", &app.zoom_rows, 6, 48);
+        ImGui::SliderFloat("Meter height", &app.view.meter_height, 32.f, 96.f, "%.0f");
+        ImGui::SliderFloat("Spectrum height", &app.view.spectrum_height, 24.f, 80.f, "%.0f");
+    }
+
+    if (ImGui::CollapsingHeader("Render WAV", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(120);
+        ImGui::DragFloat("Seconds", &app.view.render_seconds, 0.5f, 1.f, 600.f, "%.1f");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##render_path", "out.wav", app.view.render_path,
+                                 sizeof(app.view.render_path));
+        const bool can_render = app.has_song() && app.view.render_seconds > 0.f;
+        if (!can_render) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Export WAV")) {
+            fs::path out = app.view.render_path[0]
+                               ? fs::path(app.view.render_path)
+                               : fs::path(app.open_path).stem().string() + ".wav";
+            try {
+                SDL_LockAudioDevice(adev);
+                bridge.player = nullptr;
+                bridge.smus = nullptr;
+                SDL_UnlockAudioDevice(adev);
+
+                if (app.smus) {
+                    app.smus->restart();
+                    dump_wav_smus(*app.smus, app.view.render_seconds, out);
+                    app.smus->restart();
+                } else if (app.player) {
+                    app.player->restart();
+                    dump_wav_mod(*app.player, app.view.render_seconds, out);
+                    app.player->restart();
+                }
+
+                SDL_LockAudioDevice(adev);
+                bridge.player = app.player.get();
+                bridge.smus = app.smus.get();
+                SDL_UnlockAudioDevice(adev);
+
+                app.view.render_status = "wrote " + out.string();
+                std::strncpy(app.view.render_path, out.string().c_str(),
+                             sizeof(app.view.render_path) - 1);
+                app.view.render_path[sizeof(app.view.render_path) - 1] = '\0';
+            } catch (const std::exception& ex) {
+                app.view.render_status = std::string("render failed: ") + ex.what();
+                SDL_LockAudioDevice(adev);
+                bridge.player = app.player.get();
+                bridge.smus = app.smus.get();
+                SDL_UnlockAudioDevice(adev);
+            }
+        }
+        if (!can_render) {
+            ImGui::EndDisabled();
+        }
+        if (!app.view.render_status.empty()) {
+            ImGui::TextWrapped("%s", app.view.render_status.c_str());
+        }
+        ImGui::TextDisabled("Offline bounce — pauses live audio briefly.");
+    }
+
+    if (ImGui::CollapsingHeader("Render Notes", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##note_path", "out.txt", app.view.note_path,
+                                 sizeof(app.view.note_path));
+        if (!app.has_song()) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Export Notes")) {
+            fs::path out = app.view.note_path[0]
+                               ? fs::path(app.view.note_path)
+                               : fs::path(app.open_path).stem().string() + ".txt";
+            try {
+                if (app.smus) {
+                    dump_notes_smus(app.smus->score(), app.smus->bpm(), out);
+                } else if (app.player) {
+                    dump_notes_mod(app.player->module(), out);
+                }
+                app.view.render_status = "wrote " + out.string();
+                std::strncpy(app.view.note_path, out.string().c_str(), sizeof(app.view.note_path) - 1);
+                app.view.note_path[sizeof(app.view.note_path) - 1] = '\0';
+            } catch (const std::exception& ex) {
+                app.view.render_status = std::string("note dump failed: ") + ex.what();
+            }
+        }
+        if (!app.has_song()) {
+            ImGui::EndDisabled();
+        }
+        ImGui::TextDisabled("Plain-text pattern / track dump.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("P  toggle this window");
+    ImGui::End();
 }
 
 static std::string format_smus_event(const smus::SEvent& ev) {
@@ -435,6 +725,8 @@ int main(int argc, char** argv) {
                     running = false;
                 } else if (k == SDLK_o) {
                     app.begin_browse();
+                } else if (k == SDLK_p) {
+                    app.show_options = !app.show_options;
                 } else if (app.smus) {
                     if (k == SDLK_SPACE) {
                         app.smus->set_playing(!app.smus->playing());
@@ -495,6 +787,12 @@ int main(int argc, char** argv) {
             ImGui::TextDisabled("  Amiga tracker  ·  %s",
                                 snap.magic.empty() ? "—" : snap.magic.c_str());
         }
+        ImGui::SameLine();
+        const float opts_w = ImGui::CalcTextSize("Options").x + ImGui::GetStyle().FramePadding.x * 2.f;
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - opts_w - ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::SmallButton("Options")) {
+            app.show_options = !app.show_options;
+        }
 
         ImGui::Separator();
 
@@ -513,8 +811,9 @@ int main(int argc, char** argv) {
 
         if (!app.has_song()) {
             ImGui::TextWrapped("%s", app.status.c_str());
-            ImGui::TextDisabled("O / Browse...  ·  Esc quit");
+            ImGui::TextDisabled("O / Browse...  ·  P options  ·  Esc quit");
             ImGui::End();
+            draw_options_window(app, adev, bridge);
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
             SDL_RenderClear(renderer);
@@ -549,13 +848,14 @@ int main(int argc, char** argv) {
                 ImGui::ProgressBar(n ? prog / float(n) : 0.f, ImVec2(-1, 10), "");
             }
 
-            ImGui::TextDisabled("Space  ·  R restart  ·  O open");
+            ImGui::TextDisabled("Space  ·  R restart  ·  O open  ·  P options");
             ImGui::TextWrapped("%s", app.status.c_str());
 
             const int chn = std::max(1, std::min(4, ssnap.tracks));
             if (ImGui::BeginTable("smus_chs", chn, ImGuiTableFlags_SizingStretchSame)) {
                 for (int ci = 0; ci < chn; ++ci) {
                     ImGui::TableNextColumn();
+                    ImGui::PushID(ci);
                     const auto& ch = ssnap.channels[size_t(ci)];
                     ImGui::PushStyleColor(ImGuiCol_Text, ch_color(ci));
                     ImGui::Text("AUD%d %s", ci, ch.active ? "" : "·");
@@ -565,8 +865,11 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("evt %d / %d%s", ssnap.track_index[size_t(ci)],
                                         ssnap.track_length[size_t(ci)],
                                         ssnap.track_done[size_t(ci)] ? " done" : "");
-                    draw_vu("vu", std::min(1.f, ch.peak * 2.4f), std::min(1.f, ch.peak_hold * 2.4f),
-                            ch_color(ci));
+                    if (app.view.show_vu) {
+                        draw_vu("vu", std::min(1.f, ch.peak * 2.4f),
+                                std::min(1.f, ch.peak_hold * 2.4f), false, app.view.meter_height);
+                    }
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -650,6 +953,7 @@ int main(int argc, char** argv) {
             ImGui::EndChild();
 
             ImGui::End();
+            draw_options_window(app, adev, bridge);
             ImGui::Render();
             SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
             SDL_RenderClear(renderer);
@@ -686,13 +990,14 @@ int main(int argc, char** argv) {
         }
 
         ImGui::TextDisabled(
-            "O open  ·  Space  ·  Left/Right order  ·  F1-F8 mute  ·  U unmute  ·  R restart");
+            "O open  ·  P options  ·  Space  ·  Left/Right order  ·  F1-F8 mute  ·  U unmute  ·  R restart");
         ImGui::TextWrapped("%s", app.status.c_str());
 
         const int chn = snap.channels;
         if (ImGui::BeginTable("chs", std::max(1, chn), ImGuiTableFlags_SizingStretchSame)) {
             for (int ci = 0; ci < chn; ++ci) {
                 ImGui::TableNextColumn();
+                ImGui::PushID(ci);
                 const auto& ch = snap.channels_state[size_t(ci)];
                 ImGui::PushStyleColor(ImGuiCol_Text, ch_color(ci));
                 ImGui::Text("CH%d %s", ci, ch.muted ? "MUTE" : "");
@@ -706,15 +1011,44 @@ int main(int argc, char** argv) {
                     }
                 }
                 ImGui::TextDisabled("%02d %s", ch.instrument, sname.c_str());
-                ImGui::PlotLines("##scope", ch.scope.data(), mod::kScopeSamples, 0, nullptr, -1.f, 1.f,
-                                 ImVec2(-1, 40));
-                draw_vu("vu", std::min(1.f, ch.peak * 2.4f), std::min(1.f, ch.peak_hold * 2.4f),
-                        ch.muted ? ImVec4(0.3f, 0.22f, 0.16f, 1.f) : ch_color(ci));
+                if (app.view.show_scopes || app.view.show_vu) {
+                    const float scope_h = app.view.meter_height;
+                    const float avail = ImGui::GetContentRegionAvail().x;
+                    const float vu_w = app.view.show_vu ? 16.f : 0.f;
+                    if (app.view.show_scopes) {
+                        ImGui::PlotLines("##scope", ch.scope.data(), mod::kScopeSamples, 0, nullptr,
+                                         -1.f, 1.f,
+                                         ImVec2(std::max(40.f, avail - vu_w), scope_h));
+                        if (app.view.show_vu) {
+                            ImGui::SameLine(0.f, 4.f);
+                        }
+                    }
+                    if (app.view.show_vu) {
+                        draw_vu("vu", std::min(1.f, ch.peak * 2.4f),
+                                std::min(1.f, ch.peak_hold * 2.4f), ch.muted, scope_h);
+                    }
+                }
                 if (ImGui::SmallButton(ch.muted ? "Unmute" : "Mute")) {
                     app.player->toggle_mute(ci);
                 }
+                ImGui::PopID();
             }
             ImGui::EndTable();
+        }
+
+        if (app.view.show_spectrum) {
+            std::array<float, mod::kScopeSamples> mix{};
+            for (int ci = 0; ci < chn; ++ci) {
+                const auto& ch = snap.channels_state[size_t(ci)];
+                if (ch.muted) {
+                    continue;
+                }
+                for (int i = 0; i < mod::kScopeSamples; ++i) {
+                    mix[size_t(i)] += ch.scope[size_t(i)];
+                }
+            }
+            ImGui::TextDisabled("SPECTRUM");
+            draw_spectrum("spec", mix.data(), mod::kScopeSamples, app.view.spectrum_height);
         }
 
         ImGui::Separator();
@@ -762,33 +1096,36 @@ int main(int argc, char** argv) {
             ImGui::EndTable();
         }
 
-        ImGui::Separator();
-        ImGui::Text("ORDERS");
-        ImGui::BeginChild("orders", ImVec2(0, 40), false, ImGuiWindowFlags_HorizontalScrollbar);
-        for (int i = 0; i < snap.song_length; ++i) {
-            if (i) {
-                ImGui::SameLine();
+        if (app.view.show_orders) {
+            ImGui::Separator();
+            ImGui::Text("ORDERS");
+            ImGui::BeginChild("orders", ImVec2(0, 40), false, ImGuiWindowFlags_HorizontalScrollbar);
+            for (int i = 0; i < snap.song_length; ++i) {
+                if (i) {
+                    ImGui::SameLine();
+                }
+                const int pat = (i < int(snap.orders.size())) ? snap.orders[size_t(i)] : 0;
+                char lab[8];
+                std::snprintf(lab, sizeof(lab), "%02d", pat);
+                if (i == snap.order_pos) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.46f, 0.12f, 1.f));
+                } else if (i < snap.order_pos) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.24f, 0.12f, 1.f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.12f, 0.08f, 1.f));
+                }
+                ImGui::PushID(i);
+                if (ImGui::SmallButton(lab)) {
+                    app.player->seek_order(i - snap.order_pos);
+                }
+                ImGui::PopID();
+                ImGui::PopStyleColor();
             }
-            const int pat = (i < int(snap.orders.size())) ? snap.orders[size_t(i)] : 0;
-            char lab[8];
-            std::snprintf(lab, sizeof(lab), "%02d", pat);
-            if (i == snap.order_pos) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.46f, 0.12f, 1.f));
-            } else if (i < snap.order_pos) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.24f, 0.12f, 1.f));
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.12f, 0.08f, 1.f));
-            }
-            ImGui::PushID(i);
-            if (ImGui::SmallButton(lab)) {
-                app.player->seek_order(i - snap.order_pos);
-            }
-            ImGui::PopID();
-            ImGui::PopStyleColor();
+            ImGui::EndChild();
         }
-        ImGui::EndChild();
 
         ImGui::End();
+        draw_options_window(app, adev, bridge);
         ImGui::Render();
         SDL_SetRenderDrawColor(renderer, 12, 8, 6, 255);
         SDL_RenderClear(renderer);

@@ -518,9 +518,6 @@ static void draw_options_window(App& app, SDL_AudioDeviceID adev, AudioBridge& b
         if (!can_render) {
             ImGui::EndDisabled();
         }
-        if (!app.view.render_status.empty()) {
-            ImGui::TextWrapped("%s", app.view.render_status.c_str());
-        }
         ImGui::TextDisabled("Offline bounce — pauses live audio briefly.");
     }
 
@@ -552,6 +549,11 @@ static void draw_options_window(App& app, SDL_AudioDeviceID adev, AudioBridge& b
             ImGui::EndDisabled();
         }
         ImGui::TextDisabled("Plain-text pattern / track dump.");
+    }
+
+    if (!app.view.render_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", app.view.render_status.c_str());
     }
 
     ImGui::Separator();

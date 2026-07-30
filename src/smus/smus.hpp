@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mod/module.hpp"
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -85,6 +87,14 @@ struct DisplayPattern {
 
 DisplayPattern bake_display_pattern(const Score& score);
 
+void save_score(const Score& score, const std::filesystem::path& path);
+
+// Lossy SMUS → ProTracker module (PCM bake of instruments, pattern grid).
+mod::Module convert_to_mod(const Score& score,
+                           const std::unordered_map<int, Instrument>& instruments);
+
+std::vector<SEvent> events_from_display_track(const DisplayPattern& pat, int ch, int default_ins);
+
 class Engine {
 public:
     static std::unique_ptr<Engine> load(const std::filesystem::path& path);
@@ -98,16 +108,35 @@ public:
     void restart();
     bool finished() const;
 
+    void toggle_mute(int ch);
+    void unmute_all();
+    bool muted(int ch) const;
+
     const Score& score() const { return score_; }
+    Score& score_mut() { return score_; }
     const DisplayPattern& display_pattern() const { return pattern_; }
+    const std::unordered_map<int, Instrument>& instruments() const { return instruments_; }
     float bpm() const { return bpm_; }
     int sample_rate() const { return sr_; }
     float beats_played() const { return beats_played_; }
     int playhead_row() const { return int(beats_played_ * 8.f); }
 
+    bool dirty() const { return dirty_; }
+    void mark_dirty() { dirty_ = true; }
+    void clear_dirty() { dirty_ = false; }
+
+    // Rebuild display bake + live track event copies from score_.tracks.
+    void sync_from_score(bool restart_playback = true);
+
+    // Tracker-style grid edit: place/clear note then rebuild that track's event list.
+    void place_note(int track, int row, int midi, int instrument_reg, int volume = -1);
+    void clear_cell(int track, int row);
+    void set_tempo_bpm(float bpm);
+
     // UI-ish snapshot
     struct ChannelSnap {
         bool active = false;
+        bool muted = false;
         int midi = 0;
         int instrument_reg = 0;
         char last_note[8]{"---"};
@@ -193,7 +222,9 @@ private:
     float beats_played_ = 0.f;
     std::vector<TrackState> tracks_;
     std::array<Voice, 4> voices_{};
+    std::array<bool, 4> muted_{};
     bool playing_ = true;
+    bool dirty_ = false;
     Instrument fallback_;
 };
 

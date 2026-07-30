@@ -556,12 +556,16 @@ void EditorState::set_order_pattern(Module& m, std::mutex& mutex, int at, int pa
 int EditorState::add_pattern(Module& m, std::mutex& mutex) {
     int idx = 0;
     int chn = 4;
+    int rows = kRows;
     {
         std::lock_guard lock(mutex);
         idx = m.pattern_count();
         chn = m.channels;
+        if (pat >= 0 && pat < m.pattern_count()) {
+            rows = std::max(1, int(m.patterns[size_t(pat)].size()));
+        }
         m.patterns.push_back(
-            std::vector<std::vector<Note>>(size_t(kRows), std::vector<Note>(size_t(chn))));
+            std::vector<std::vector<Note>>(size_t(rows), std::vector<Note>(size_t(chn))));
     }
     UndoOp op;
     op.label = "add pat";
@@ -570,14 +574,150 @@ int EditorState::add_pattern(Module& m, std::mutex& mutex) {
             mod.patterns.resize(size_t(idx));
         }
     };
-    op.redo = [idx, chn](Module& mod) {
+    op.redo = [idx, chn, rows](Module& mod) {
         while (mod.pattern_count() <= idx) {
             mod.patterns.push_back(
-                std::vector<std::vector<Note>>(size_t(kRows), std::vector<Note>(size_t(chn))));
+                std::vector<std::vector<Note>>(size_t(rows), std::vector<Note>(size_t(chn))));
         }
     };
     push_undo(std::move(op));
     return idx;
+}
+
+void EditorState::set_pattern_length(Module& m, std::mutex& mutex, int pat_index, int rows) {
+    rows = std::clamp(rows, 1, 256);
+    std::vector<std::vector<Note>> before;
+    std::vector<std::vector<Note>> after;
+    {
+        std::lock_guard lock(mutex);
+        ensure_pattern(m, pat_index);
+        if (pat_index < 0 || pat_index >= m.pattern_count()) {
+            return;
+        }
+        auto& p = m.patterns[size_t(pat_index)];
+        before = p;
+        const int chn = std::max(1, m.channels);
+        if (int(p.size()) < rows) {
+            p.resize(size_t(rows), std::vector<Note>(size_t(chn)));
+        } else if (int(p.size()) > rows) {
+            p.resize(size_t(rows));
+        }
+        for (auto& r : p) {
+            r.resize(size_t(chn));
+        }
+        after = p;
+        if (pat == pat_index) {
+            row = std::clamp(row, 0, rows - 1);
+            if (has_sel) {
+                sel_row0 = std::clamp(sel_row0, 0, rows - 1);
+                sel_row1 = std::clamp(sel_row1, 0, rows - 1);
+            }
+        }
+    }
+    if (before.size() == after.size()) {
+        return;
+    }
+    UndoOp op;
+    op.label = "pat len";
+    op.undo = [pat_index, before](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = before;
+        }
+    };
+    op.redo = [pat_index, after](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = after;
+        }
+    };
+    push_undo(std::move(op));
+}
+
+void EditorState::insert_rows(Module& m, std::mutex& mutex, int pat_index, int at, int count) {
+    count = std::max(1, count);
+    std::vector<std::vector<Note>> before;
+    std::vector<std::vector<Note>> after;
+    {
+        std::lock_guard lock(mutex);
+        ensure_pattern(m, pat_index);
+        if (pat_index < 0 || pat_index >= m.pattern_count()) {
+            return;
+        }
+        auto& p = m.patterns[size_t(pat_index)];
+        before = p;
+        at = std::clamp(at, 0, int(p.size()));
+        if (int(p.size()) + count > 256) {
+            count = 256 - int(p.size());
+        }
+        if (count <= 0) {
+            return;
+        }
+        const int chn = std::max(1, m.channels);
+        p.insert(p.begin() + at, size_t(count), std::vector<Note>(size_t(chn)));
+        after = p;
+        if (pat == pat_index && row >= at) {
+            row = std::min(255, row + count);
+        }
+    }
+    UndoOp op;
+    op.label = "ins rows";
+    op.undo = [pat_index, before](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = before;
+        }
+    };
+    op.redo = [pat_index, after](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = after;
+        }
+    };
+    push_undo(std::move(op));
+}
+
+void EditorState::delete_rows(Module& m, std::mutex& mutex, int pat_index, int at, int count) {
+    count = std::max(1, count);
+    std::vector<std::vector<Note>> before;
+    std::vector<std::vector<Note>> after;
+    {
+        std::lock_guard lock(mutex);
+        ensure_pattern(m, pat_index);
+        if (pat_index < 0 || pat_index >= m.pattern_count()) {
+            return;
+        }
+        auto& p = m.patterns[size_t(pat_index)];
+        if (p.size() <= 1 || at < 0 || at >= int(p.size())) {
+            return;
+        }
+        before = p;
+        count = std::min(count, int(p.size()) - at);
+        if (count >= int(p.size())) {
+            count = int(p.size()) - 1;  // keep at least one row
+        }
+        if (count <= 0) {
+            return;
+        }
+        p.erase(p.begin() + at, p.begin() + at + count);
+        after = p;
+        if (pat == pat_index) {
+            row = std::clamp(row, 0, std::max(0, int(p.size()) - 1));
+            if (has_sel) {
+                sel_row0 = std::clamp(sel_row0, 0, int(p.size()) - 1);
+                sel_row1 = std::clamp(sel_row1, 0, int(p.size()) - 1);
+            }
+        }
+    }
+    UndoOp op;
+    op.label = "del rows";
+    op.undo = [pat_index, before](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = before;
+        }
+    };
+    op.redo = [pat_index, after](Module& mod) {
+        if (pat_index < mod.pattern_count()) {
+            mod.patterns[size_t(pat_index)] = after;
+        }
+    };
+    push_undo(std::move(op));
 }
 
 void EditorState::replace_sample(Module& m, std::mutex& mutex, int slot, Sample next) {

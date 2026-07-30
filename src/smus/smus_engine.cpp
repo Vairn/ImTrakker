@@ -120,6 +120,127 @@ void Engine::restart() {
     advance_tracks(0.f);
 }
 
+void Engine::toggle_mute(int ch) {
+    if (ch >= 0 && ch < int(muted_.size())) {
+        muted_[size_t(ch)] = !muted_[size_t(ch)];
+    }
+}
+
+void Engine::unmute_all() {
+    muted_.fill(false);
+}
+
+bool Engine::muted(int ch) const {
+    return ch >= 0 && ch < int(muted_.size()) && muted_[size_t(ch)];
+}
+
+void Engine::sync_from_score(bool restart_playback) {
+    pattern_ = bake_display_pattern(score_);
+    bpm_ = std::max(score_.tempo / 128.f, 1.f);
+    beat_samples_ = (60.f / bpm_) * float(sr_);
+    score_volume_ = float(score_.volume) / 127.f;
+    if (restart_playback) {
+        restart();
+    } else {
+        // Refresh track event copies without full restart of voices if possible.
+        const size_t n = std::min(tracks_.size(), score_.tracks.size());
+        for (size_t i = 0; i < n; ++i) {
+            const int idx = tracks_[i].index;
+            tracks_[i].events = score_.tracks[i];
+            tracks_[i].index = std::clamp(idx, 0, int(tracks_[i].events.size()));
+        }
+        while (tracks_.size() < score_.tracks.size() && tracks_.size() < 4) {
+            TrackState tr;
+            tr.events = score_.tracks[tracks_.size()];
+            tracks_.push_back(std::move(tr));
+            prime_track(tracks_.back());
+        }
+    }
+}
+
+void Engine::place_note(int track, int row, int midi, int instrument_reg, int volume) {
+    if (track < 0 || track >= 4) {
+        return;
+    }
+    while (int(score_.tracks.size()) <= track) {
+        score_.tracks.emplace_back();
+    }
+    pattern_ = bake_display_pattern(score_);
+    if (pattern_.channels <= track) {
+        // Ensure display has this channel by padding empty tracks already done;
+        // force at least track+1 channels worth of rows.
+        if (pattern_.rows < 1) {
+            pattern_.rows = 64;
+            pattern_.channels = track + 1;
+            pattern_.cells.assign(64, std::vector<PatternCell>(size_t(track + 1)));
+        }
+    }
+    if (row < 0) {
+        return;
+    }
+    if (row >= pattern_.rows) {
+        const int old = pattern_.rows;
+        pattern_.rows = row + 1;
+        pattern_.cells.resize(size_t(pattern_.rows));
+        for (int r = old; r < pattern_.rows; ++r) {
+            pattern_.cells[size_t(r)].assign(size_t(std::max(pattern_.channels, track + 1)),
+                                             PatternCell{});
+        }
+        pattern_.channels = std::max(pattern_.channels, track + 1);
+        for (int r = 0; r < old; ++r) {
+            pattern_.cells[size_t(r)].resize(size_t(pattern_.channels));
+        }
+    }
+    pattern_.channels = std::max(pattern_.channels, track + 1);
+    for (auto& crow : pattern_.cells) {
+        crow.resize(size_t(pattern_.channels));
+    }
+    PatternCell& cell = pattern_.cells[size_t(row)][size_t(track)];
+    cell.midi = std::clamp(midi, 1, 127);
+    cell.instrument = instrument_reg;
+    cell.volume = volume;
+    cell.rest = false;
+    // Reformat text roughly
+    static const char* kNames[12] = {"C-", "C#", "D-", "D#", "E-", "F-",
+                                     "F#", "G-", "G#", "A-", "A#", "B-"};
+    const int oct = cell.midi / 12 - 1;
+    std::snprintf(cell.text, sizeof(cell.text), "%s%d %02X ...", kNames[cell.midi % 12], oct,
+                  instrument_reg);
+
+    int def_ins = instrument_reg;
+    score_.tracks[size_t(track)] = events_from_display_track(pattern_, track, def_ins);
+    mark_dirty();
+    sync_from_score(true);
+}
+
+void Engine::clear_cell(int track, int row) {
+    if (track < 0 || row < 0) {
+        return;
+    }
+    pattern_ = bake_display_pattern(score_);
+    if (track >= pattern_.channels || row >= pattern_.rows) {
+        return;
+    }
+    pattern_.cells[size_t(row)][size_t(track)] = PatternCell{};
+    int def_ins = 0;
+    if (!score_.instruments.empty()) {
+        def_ins = score_.instruments.begin()->first;
+    }
+    if (track < int(score_.tracks.size())) {
+        score_.tracks[size_t(track)] = events_from_display_track(pattern_, track, def_ins);
+    }
+    mark_dirty();
+    sync_from_score(true);
+}
+
+void Engine::set_tempo_bpm(float bpm) {
+    bpm = std::max(1.f, bpm);
+    score_.tempo = int(std::lround(bpm * 128.f));
+    bpm_ = bpm;
+    beat_samples_ = (60.f / bpm_) * float(sr_);
+    mark_dirty();
+}
+
 bool Engine::finished() const {
     bool tracks_done = true;
     for (const auto& t : tracks_) {
@@ -550,6 +671,9 @@ void Engine::render(float* interleaved_stereo, int n_frames) {
         for (auto& v : voices_) {
             if (v.active && v.instrument) {
                 render_voice(v, mono.data(), g);
+                if (muted_[size_t(v.channel & 3)]) {
+                    continue;
+                }
                 const int side = kChannelPan[v.channel & 3];
                 for (int i = 0; i < g; ++i) {
                     interleaved_stereo[(frame + i) * 2 + side] += mono[size_t(i)];
@@ -585,6 +709,7 @@ Engine::Snapshot Engine::snapshot() const {
         const Voice& v = voices_[i];
         ChannelSnap& ch = s.channels[i];
         ch.active = v.active;
+        ch.muted = muted_[i];
         ch.midi = v.midi;
         ch.instrument_reg = v.instrument_reg;
         std::snprintf(ch.last_note, sizeof(ch.last_note), "%s", v.last_note);

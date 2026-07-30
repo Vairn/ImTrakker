@@ -9,6 +9,7 @@ Built as a sibling project to the [Dune Amiga](../Amiga/Dune) reverse-engineerin
 | Format | Play | Edit / Save |
 |--------|------|-------------|
 | ProTracker / Startrekker (`.mod`) | yes | yes (save as `.mod`) |
+| SoundFX 1.3 / 2.0 (`.sfx` / `.sfx2`) | yes | edit in memory → save as `.mod` |
 | OctaMED MMD0–3 | yes | edit in memory → save as `.mod` |
 | Sonix SMUS | yes | play-only |
 | HSQ-packed mods | yes (unpack) | — |
@@ -22,7 +23,9 @@ Built as a sibling project to the [Dune Amiga](../Amiga/Dune) reverse-engineerin
 | `6CHN` | 6 |
 | `8CHN` / `FLT8` | 8 |
 
-Effect subset: arpeggio, porta, volume, speed/tempo, break/jump.
+Effect set: full ProTracker 2.3d (0–F and E0–EF), including vibrato/tremolo,
+tone porta, sample offset, volume slide, finetune tables, pattern loop/delay,
+note cut/delay, retrig, invert loop, and Amiga LED filter (E0).
 
 ## Build (Windows / MSYS2 UCRT64)
 

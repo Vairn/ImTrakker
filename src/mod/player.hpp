@@ -12,14 +12,36 @@ namespace mod {
 struct ChannelState {
     const Sample* sample = nullptr;
     double sample_pos = 0.0;
-    int period = 0;
-    int volume = 0;
+    int period = 0;       // stored period (n_period)
+    int out_period = 0;   // Paula period after vibrato/arpeggio
+    int volume = 0;       // stored volume 0..64
+    int out_volume = 0;   // after tremolo
     int instrument = 0;
+    int finetune = 0;     // signed -8..7
     int effect = 0;
     int param = 0;
-    int porta_speed = 0;
-    int arp_period = 0;
     bool muted = false;
+
+    // Effect memory / state (ProTracker 2.3d)
+    int porta_speed = 0;          // tone porta 3xx memory
+    int wanted_period = 0;        // tone porta target
+    int tone_porta_dir = 0;       // 0 = down (period+), 1 = up (period-)
+    bool glissando = false;
+    int vib_speed = 0;
+    int vib_depth = 0;
+    int vib_pos = 0;              // signed-ish 0..255 wrapping
+    int trem_speed = 0;
+    int trem_depth = 0;
+    int trem_pos = 0;
+    int wave_control = 0;         // low 2 = vib wave, bit2 = no retrig; high nibble = trem
+    int sample_offset = 0;        // 9xx memory (high byte of byte offset)
+    int loop_row = 0;             // E6 pattern loop start
+    int loop_count = 0;
+    int funk_speed = 0;           // EFx high nibble via glissfunk
+    int funk_offset = 0;
+    int funk_pos = 0;             // byte index into sample for invert loop
+    bool delay_note = false;
+    Note delayed{};
 
     float peak = 0.f;
     float peak_hold = 0.f;
@@ -54,6 +76,7 @@ public:
         int row = 0;
         int tick = 0;
         int speed = 6;
+        
         int tempo = 125;
         int song_length = 0;
         int channels = 4;
@@ -74,14 +97,26 @@ public:
 
     void toggle_mute(int ch);
     void unmute_all();
+    // Remap all patterns + magic and resize mixer voices (2–8).
+    void set_channel_count(int channels);
 
 private:
     void process_tick();
-    void trigger(ChannelState& ch, const Note& note);
+    void trigger(ChannelState& ch, const Note& note, bool force_retrig);
+    void apply_row_fx(ChannelState& ch, const Note& note);
     void tick_fx(ChannelState& ch);
+    void do_tone_porta(ChannelState& ch);
+    void do_vibrato(ChannelState& ch);
+    void do_tremolo(ChannelState& ch);
+    void do_vol_slide(ChannelState& ch, int param);
+    void do_arpeggio(ChannelState& ch);
+    void do_retrig(ChannelState& ch);
+    void update_funk(ChannelState& ch);
+    int vib_wave(ChannelState& ch, int pos, int wave) const;
     void mix(float* left, float* right, int n);
     int samples_per_tick() const;
     int pattern_index_unlocked() const;
+    void advance_row();
 
     void mix_audition(float* left, float* right, int n);
 
@@ -93,6 +128,12 @@ private:
     int tempo_ = 125;
     int pattern_break_ = -1;
     int pattern_jump_ = -1;
+    int pattern_delay_ = 0;  // remaining extra replays of current row (EEx)
+    bool pattern_loop_ = false;
+    int pattern_loop_to_ = 0;
+    bool filter_on_ = true;  // Amiga LED filter; E0x
+    float filter_l_ = 0.f;
+    float filter_r_ = 0.f;
     std::vector<ChannelState> channels_;
     bool playing_ = true;
     bool finished_ = false;

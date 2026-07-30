@@ -4,6 +4,12 @@
 #include "mod/sample_io.hpp"
 #include "mod/sample_edit.hpp"
 #include "smus/smus.hpp"
+#include "midi.hpp"
+#include "modarchive.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <future>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -140,19 +146,122 @@ struct App {
     int pending_steal_instr = 1;
     bool pending_steal_mod = false;
     char sample_name_buf[23]{};
+    int audition_held_key = 0;  // SDL keycode while piano audition is held
+    int new_channels = 4;
+    int selected_smus_instr = -1;
+    int smus_edit_octave = 5;   // MIDI octave ~ C5
+    int smus_edit_instr = 0;
+    bool smus_edit_mode = true;
+    midi::Input midi_in;
+    bool midi_to_pattern = true;
+    std::future<modarchive::FetchResult> pending_modarchive;
+    std::atomic<bool> modarchive_busy{false};
 
     bool has_song() const { return player || smus; }
+
+    fs::path modarchive_cache_dir() const {
+        if (!data_dir.empty()) {
+            return data_dir / "modarchive";
+        }
+        return fs::temp_directory_path() / "imtrakker_modarchive";
+    }
+
+    void begin_modarchive_random() {
+        if (modarchive_busy || pending_modarchive.valid()) {
+            return;
+        }
+        if (!confirm_discard()) {
+            return;
+        }
+        modarchive_busy = true;
+        status = "Fetching random module from Mod Archive…";
+        flash = 0.4f;
+        const fs::path cache = modarchive_cache_dir();
+        pending_modarchive = std::async(std::launch::async, [cache]() {
+            return modarchive::fetch_random(cache);
+        });
+    }
+
+    bool confirm_discard() const {
+        const bool dirty_mod = player && editor.dirty;
+        const bool dirty_smus = smus && smus->dirty();
+        if (!dirty_mod && !dirty_smus) {
+            return true;
+        }
+        const auto answer = pfd::message("Unsaved changes",
+                                         "Discard unsaved edits and continue?",
+                                         pfd::choice::yes_no, pfd::icon::warning)
+                                .result();
+        return answer == pfd::button::yes;
+    }
+
+    // Returns false if the user cancels after a ProTracker-limits warning.
+    bool confirm_mod_save_limits() {
+        if (!player) {
+            return true;
+        }
+        bool long_pat = false;
+        bool short_pat = false;
+        int bad_rows = 0;
+        int extra_samples = 0;
+        {
+            std::lock_guard lock(player->mutex());
+            const auto& mod = player->module();
+            for (int p = 0; p < mod.pattern_count(); ++p) {
+                const int rows = int(mod.patterns[size_t(p)].size());
+                if (rows > mod::kRows) {
+                    long_pat = true;
+                    if (bad_rows == 0) {
+                        bad_rows = rows;
+                    }
+                } else if (rows > 0 && rows < mod::kRows) {
+                    short_pat = true;
+                    if (bad_rows == 0) {
+                        bad_rows = rows;
+                    }
+                }
+            }
+            for (int i = 31; i < int(mod.samples.size()); ++i) {
+                const auto& s = mod.samples[size_t(i)];
+                if (s.length_words > 0 || s.wave.size() > 2) {
+                    ++extra_samples;
+                }
+            }
+        }
+        if (!long_pat && !short_pat && extra_samples == 0) {
+            return true;
+        }
+        std::string msg = "ProTracker .mod save will alter this song:\n";
+        if (long_pat || short_pat) {
+            msg += "• Pattern(s) with " + std::to_string(bad_rows) +
+                   " rows (save forces 64";
+            if (long_pat) {
+                msg += "; longer rows truncated";
+            }
+            msg += ")\n";
+        }
+        if (extra_samples > 0) {
+            msg += "• " + std::to_string(extra_samples) +
+                   " sample(s) beyond slot 31 will be dropped\n";
+        }
+        msg += "\nSave anyway?";
+        const auto answer =
+            pfd::message("Save limits", msg, pfd::choice::yes_no, pfd::icon::warning).result();
+        return answer == pfd::button::yes;
+    }
 
     bool load_path(const fs::path& path) {
         try {
             if (smus::is_smus_file(path)) {
                 player.reset();
                 smus = smus::Engine::load(path);
+                selected_smus_instr = -1;
                 status = path.string() + "  (SMUS / Sonix, " +
                          std::to_string(smus->score().tracks.size()) + " tracks, " +
                          std::to_string(int(smus->bpm())) + " BPM)";
             } else {
                 smus.reset();
+                selected_smus_instr = -1;
                 auto module = mod::load_module(path);
                 if (!player) {
                     player = std::make_unique<mod::Player>(std::move(module));
@@ -191,7 +300,11 @@ struct App {
 
     void new_song(int channels = 4) {
         smus.reset();
+        selected_smus_instr = -1;
+        channels = std::clamp(channels, 2, 8);
+        new_channels = channels;
         auto module = mod::make_blank(channels);
+        const std::string magic = module.magic;
         if (!player) {
             player = std::make_unique<mod::Player>(std::move(module));
         } else {
@@ -202,7 +315,7 @@ struct App {
         sync_sample_name_buf();
         std::strncpy(open_path, "untitled.mod", sizeof(open_path) - 1);
         open_path[sizeof(open_path) - 1] = '\0';
-        status = "New song (4ch M.K.) — edit and Save As…";
+        status = "New song (" + std::to_string(channels) + "ch " + magic + ") — edit and Save As…";
         flash = 0.5f;
     }
 
@@ -211,6 +324,10 @@ struct App {
             return false;
         }
         try {
+            if (!confirm_mod_save_limits()) {
+                status = "save cancelled";
+                return false;
+            }
             {
                 std::lock_guard lock(player->mutex());
                 player->module().title = editor.title_buf;
@@ -228,6 +345,52 @@ struct App {
         }
     }
 
+    bool save_smus_to(const fs::path& path) {
+        if (!smus) {
+            return false;
+        }
+        try {
+            smus->score_mut().path = path;
+            if (smus->score().name.empty()) {
+                smus->score_mut().name = path.stem().string();
+            }
+            smus::save_score(smus->score(), path);
+            smus->clear_dirty();
+            std::strncpy(open_path, path.string().c_str(), sizeof(open_path) - 1);
+            open_path[sizeof(open_path) - 1] = '\0';
+            status = "saved SMUS " + path.string();
+            return true;
+        } catch (const std::exception& e) {
+            status = std::string("SMUS save failed: ") + e.what();
+            return false;
+        }
+    }
+
+    void convert_smus_to_mod() {
+        if (!smus) {
+            return;
+        }
+        try {
+            auto module = smus::convert_to_mod(smus->score(), smus->instruments());
+            smus.reset();
+            selected_smus_instr = -1;
+            if (!player) {
+                player = std::make_unique<mod::Player>(std::move(module));
+            } else {
+                player->load(std::move(module));
+            }
+            editor.reset_for_module(player->module());
+            editor.mark_dirty();
+            sync_sample_name_buf();
+            std::strncpy(open_path, "from_smus.mod", sizeof(open_path) - 1);
+            open_path[sizeof(open_path) - 1] = '\0';
+            status = "Converted SMUS → MOD (lossy PCM bake) — Save As… to keep";
+            flash = 0.5f;
+        } catch (const std::exception& e) {
+            status = std::string("SMUS→MOD failed: ") + e.what();
+        }
+    }
+
     void begin_browse() {
         if (pending_open) {
             return;
@@ -236,18 +399,26 @@ struct App {
         pending_open = std::make_shared<pfd::open_file>(
             "Open module", start,
             std::vector<std::string>{
-                "Modules", "*.mod *.hsq *.mmd0 *.mmd1 *.mmd2 *.mmd3 *.smus",
+                "Modules",
+                "*.mod *.xm *.s3m *.it *.hsq *.mmd0 *.mmd1 *.mmd2 *.mmd3 *.smus *.sfx *.sfx2",
                 "All files", "*.*"});
     }
 
     void begin_save_as() {
-        if (pending_save || !player) {
+        if (pending_save) {
             return;
         }
-        const std::string start = open_path[0] ? open_path : "untitled.mod";
-        pending_save = std::make_shared<pfd::save_file>(
-            "Save module", start,
-            std::vector<std::string>{"ProTracker module", "*.mod", "All files", "*.*"});
+        if (player) {
+            const std::string start = open_path[0] ? open_path : "untitled.mod";
+            pending_save = std::make_shared<pfd::save_file>(
+                "Save module", start,
+                std::vector<std::string>{"ProTracker module", "*.mod", "All files", "*.*"});
+        } else if (smus) {
+            const std::string start = open_path[0] ? open_path : "untitled.smus";
+            pending_save = std::make_shared<pfd::save_file>(
+                "Save SMUS", start,
+                std::vector<std::string>{"Sonix SMUS", "*.smus", "All files", "*.*"});
+        }
     }
 
     void begin_sample_load(bool from_mod) {
@@ -259,8 +430,9 @@ struct App {
         if (from_mod) {
             pending_sample_open = std::make_shared<pfd::open_file>(
                 "Load sample from module", start,
-                std::vector<std::string>{"Modules", "*.mod *.mmd0 *.mmd1 *.mmd2 *.mmd3", "All files",
-                                         "*.*"});
+                std::vector<std::string>{
+                    "Modules", "*.mod *.mmd0 *.mmd1 *.mmd2 *.mmd3 *.sfx *.sfx2", "All files",
+                    "*.*"});
         } else {
             pending_sample_open = std::make_shared<pfd::open_file>(
                 "Load sample", start,
@@ -722,7 +894,7 @@ static void draw_sample_editor(App& app) {
         ImGui::SameLine();
         op("NoLoop", [&](mod::Sample& sm, mod::SampleSel&) { mod::sample_disable_loop(sm); });
 
-        ImGui::TextDisabled("Audition: tracker note keys  ·  Esc stops preview");
+        ImGui::TextDisabled("Audition: hold note keys  ·  release / Esc stops");
         ImGui::EndTable();
     }
 }
@@ -794,7 +966,8 @@ static void draw_help_window(App& app) {
                 "pattern grid, load samples, then Save as a .mod file.");
             ImGui::Spacing();
             ImGui::BulletText("New — start a blank 4-channel song");
-            ImGui::BulletText("Browse / Open — load .mod, MMD, or .smus");
+            ImGui::BulletText("Browse / Open — load .mod, XM/S3M/IT, MMD, SoundFX .sfx, or .smus");
+            ImGui::BulletText("Random (M) — grab a random module from modarchive.org");
             ImGui::BulletText("Turn Edit on (toolbar) before typing notes");
             ImGui::BulletText("F9 Pattern editor  ·  F10 Sample editor");
             ImGui::BulletText("Save / Save As… — write a ProTracker .mod");
@@ -868,8 +1041,9 @@ static void draw_help_window(App& app) {
                 "Amplify · Oct− / Oct+ (resample)");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Audition: on the Sample page, press piano keys to preview the selected "
-                "slot without changing the pattern. Esc stops the preview.");
+                "Audition: on the Sample page, hold piano keys to preview the selected "
+                "slot without changing the pattern. Release the key (or Esc) to stop — "
+                "looped samples would otherwise sustain forever.");
             ImGui::EndTabItem();
         }
 
@@ -889,13 +1063,21 @@ static void draw_help_window(App& app) {
                 row("R", "Restart from beginning");
                 row("Play from cursor", "Jump playhead to edit row");
                 row("← → (Edit off)", "Seek previous / next order");
-                row("F1–F8", "Mute / unmute channel");
+                row("Ins / +Row", "Insert empty row at cursor");
+                row("Ctrl+Del / -Row", "Delete row at cursor");
+                row("Rows", "Change pattern length (1–256)");
+                row("Ch combo", "Change song channel count (2–8)");
+                row("F1–F8", "Mute / unmute channel (F1–F4 in SMUS)");
                 row("U", "Unmute all");
                 row("Ctrl+N / Ctrl+S", "New song / Save");
+                row("New ch", "Channel count combo next to New (2–8)");
+                row("Rst", "Restart order (loop point)");
                 row("O", "Open file browser");
+                row("M", "Random module from Mod Archive");
                 row("P", "Options (display + WAV/note export)");
                 row("H", "This help page");
                 row("Esc", "Stop audition, or quit");
+                row("Note keys", "Audition sample (hold; release to stop)");
                 ImGui::EndTable();
             }
             ImGui::Spacing();
@@ -921,15 +1103,19 @@ static void draw_help_window(App& app) {
                     ImGui::TextUnformatted(e);
                 };
                 row(".mod (M.K. / FLT4 / …)", "yes", "yes → Save as .mod");
-                row("MMD0–3 (OctaMED)", "yes", "edit → export .mod");
-                row(".smus (Sonix)", "yes", "play only");
+                row("SoundTracker 15-sample", "yes", "load → Save as .mod");
+                row("SoundFX 1.3 / 2.0 (.sfx)", "yes", "load → Save as .mod");
+                row("XM / S3M / IT", "yes*", "load → edit as .mod (*lossy)");
+                row("MMD0–3 (OctaMED)", "yes", "edit → export .mod (synth baked)");
+                row(".smus (Sonix)", "yes", "edit + save .smus / → MOD");
                 row(".hsq packed mod", "yes", "—");
                 ImGui::EndTable();
             }
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Effects supported in playback: arpeggio (0), porta (1/2), tone porta (3), "
-                "volume (C), break (D), jump (B), speed/tempo (F).");
+                "Playback effects: full ProTracker 2.3d set (0–F and E0–EF) — arpeggio, porta, "
+                "tone porta, vibrato, tremolo, offset, volume slide, finetune, pattern loop/delay, "
+                "retrig, note cut/delay, invert loop, LED filter, speed/tempo, jump/break.");
             ImGui::EndTabItem();
         }
 
@@ -1185,6 +1371,47 @@ int main(int argc, char** argv) {
         prev = now;
         app.flash = std::max(0.f, app.flash - dt);
 
+        if (app.pending_modarchive.valid() &&
+            app.pending_modarchive.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            const modarchive::FetchResult r = app.pending_modarchive.get();
+            app.modarchive_busy = false;
+            if (r.ok) {
+                app.status = "Mod Archive #" + std::to_string(r.module_id) + " — " + r.title;
+                app.pending_load = r.path.string();
+                app.flash = 0.5f;
+            } else {
+                app.status = "Mod Archive: " + r.error;
+            }
+        }
+
+        // MIDI → pattern / audition
+        for (const midi::Event& mev : app.midi_in.poll()) {
+            if (!mev.note_on) {
+                if (app.player) {
+                    app.player->stop_audition();
+                }
+                continue;
+            }
+            if (app.smus && app.midi_to_pattern && app.smus_edit_mode) {
+                const int row = std::max(0, app.smus->playhead_row());
+                const int tr = 0;
+                app.smus->place_note(tr, row, mev.note, app.smus_edit_instr);
+                app.status = "MIDI note " + std::to_string(mev.note) + " @ row " + std::to_string(row);
+            } else if (app.player && app.midi_to_pattern && app.editor.edit_mode &&
+                       app.editor.view == mod::EditorView::Pattern) {
+                const int period = mod::midi_to_period(mev.note);
+                if (period) {
+                    app.editor.set_period(app.player->module(), app.player->mutex(), period, true);
+                    app.player->audition(app.editor.instrument, period);
+                }
+            } else if (app.player) {
+                const int period = mod::midi_to_period(mev.note);
+                if (period) {
+                    app.player->audition(app.editor.instrument, period);
+                }
+            }
+        }
+
         // Complete async file dialog / typed open outside the ImGui frame.
         if (app.pending_open && app.pending_open->ready()) {
             auto selection = app.pending_open->result();
@@ -1214,10 +1441,14 @@ int main(int argc, char** argv) {
                 app.pending_sample_save_path = path;
             }
         }
-        if (!app.pending_save_path.empty() && app.player) {
+        if (!app.pending_save_path.empty()) {
             const fs::path path = app.pending_save_path;
             app.pending_save_path.clear();
-            app.save_to(path);
+            if (app.player) {
+                app.save_to(path);
+            } else if (app.smus) {
+                app.save_smus_to(path);
+            }
         }
         if (!app.pending_sample_load.empty() && app.player) {
             const fs::path path = app.pending_sample_load;
@@ -1260,15 +1491,19 @@ int main(int argc, char** argv) {
         }
         if (!app.pending_load.empty()) {
             const fs::path path = app.pending_load;
-            app.pending_load.clear();
-            SDL_LockAudioDevice(adev);
-            bridge.player = nullptr;
-            bridge.smus = nullptr;
-            SDL_UnlockAudioDevice(adev);
-            if (app.load_path(path)) {
-                apply_loaded_module();
-            } else if (app.has_song()) {
-                apply_loaded_module();
+            if (!app.confirm_discard()) {
+                app.pending_load.clear();
+            } else {
+                app.pending_load.clear();
+                SDL_LockAudioDevice(adev);
+                bridge.player = nullptr;
+                bridge.smus = nullptr;
+                SDL_UnlockAudioDevice(adev);
+                if (app.load_path(path)) {
+                    apply_loaded_module();
+                } else if (app.has_song()) {
+                    apply_loaded_module();
+                }
             }
         }
 
@@ -1278,32 +1513,54 @@ int main(int argc, char** argv) {
             if (e.type == SDL_QUIT) {
                 running = false;
             }
+            if (e.type == SDL_KEYUP && app.player && app.audition_held_key != 0) {
+                const SDL_Keycode k = e.key.keysym.sym;
+                const int key = (k >= 0 && k < 256) ? int(std::tolower(char(k))) : int(k);
+                if (key == app.audition_held_key) {
+                    app.player->stop_audition();
+                    app.audition_held_key = 0;
+                }
+            }
             // Only yield keys while typing in an ImGui text field. WantCaptureKeyboard is
             // almost always true (focused buttons/selectables) and was blocking the editor.
             if (e.type == SDL_KEYDOWN && !io.WantTextInput) {
                 const SDL_Keycode k = e.key.keysym.sym;
                 const bool ctrl = (e.key.keysym.mod & KMOD_CTRL) != 0;
                 const bool shift = (e.key.keysym.mod & KMOD_SHIFT) != 0;
+                const bool repeat = e.key.repeat != 0;
                 if (k == SDLK_ESCAPE) {
                     if (app.player && app.player->auditioning()) {
                         app.player->stop_audition();
+                        app.audition_held_key = 0;
                     } else {
                         running = false;
                     }
                 } else if (k == SDLK_o && !ctrl) {
                     app.begin_browse();
-                } else if (k == SDLK_n && ctrl && !app.smus) {
-                    SDL_LockAudioDevice(adev);
-                    bridge.player = nullptr;
-                    bridge.smus = nullptr;
-                    SDL_UnlockAudioDevice(adev);
-                    app.new_song();
-                    apply_loaded_module();
-                } else if (k == SDLK_s && ctrl && app.player) {
-                    if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr) {
-                        app.save_to(app.open_path);
-                    } else {
-                        app.begin_save_as();
+                } else if (k == SDLK_m && !ctrl && !app.modarchive_busy) {
+                    app.begin_modarchive_random();
+                } else if (k == SDLK_n && ctrl) {
+                    if (app.confirm_discard()) {
+                        SDL_LockAudioDevice(adev);
+                        bridge.player = nullptr;
+                        bridge.smus = nullptr;
+                        SDL_UnlockAudioDevice(adev);
+                        app.new_song(app.new_channels);
+                        apply_loaded_module();
+                    }
+                } else if (k == SDLK_s && ctrl) {
+                    if (app.player) {
+                        if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr) {
+                            app.save_to(app.open_path);
+                        } else {
+                            app.begin_save_as();
+                        }
+                    } else if (app.smus) {
+                        if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr) {
+                            app.save_smus_to(app.open_path);
+                        } else {
+                            app.begin_save_as();
+                        }
                     }
                 } else if (k == SDLK_p && !ctrl) {
                     app.show_options = !app.show_options;
@@ -1315,6 +1572,10 @@ int main(int argc, char** argv) {
                     } else if (k == SDLK_r) {
                         app.smus->restart();
                         app.flash = 0.4f;
+                    } else if (k >= SDLK_F1 && k <= SDLK_F4) {
+                        app.smus->toggle_mute(k - SDLK_F1);
+                    } else if (k == SDLK_u) {
+                        app.smus->unmute_all();
                     }
                 } else if (app.player) {
                     auto& ed = app.editor;
@@ -1340,12 +1601,18 @@ int main(int argc, char** argv) {
                         app.flash = 0.4f;
                     } else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
                         if (ed.view == mod::EditorView::Pattern && ed.edit_mode) {
-                            if (ed.has_sel) {
+                            if (ctrl && k == SDLK_DELETE) {
+                                ed.delete_rows(app.player->module(), app.player->mutex(), ed.pat,
+                                               ed.row, 1);
+                            } else if (ed.has_sel) {
                                 ed.clear_block(app.player->module(), app.player->mutex());
                             } else {
                                 ed.clear_cell(app.player->module(), app.player->mutex());
                             }
                         }
+                    } else if (k == SDLK_INSERT && ed.view == mod::EditorView::Pattern &&
+                               ed.edit_mode) {
+                        ed.insert_rows(app.player->module(), app.player->mutex(), ed.pat, ed.row, 1);
                     } else if (ed.edit_mode &&
                                ed.handle_nav_key(app.player->module(), int(k), shift)) {
                         // cursor / field move
@@ -1359,7 +1626,7 @@ int main(int argc, char** argv) {
                         app.player->toggle_mute(k - SDLK_F1);
                     } else if (k == SDLK_u) {
                         app.player->unmute_all();
-                    } else {
+                    } else if (!repeat) {
                         int period = 0;
                         const int key =
                             (k >= 0 && k < 256) ? int(std::tolower(char(k))) : int(k);
@@ -1370,6 +1637,7 @@ int main(int argc, char** argv) {
                                                     ? (ed.sample_slot + 1)
                                                     : ed.instrument;
                                 app.player->audition(ins, period);
+                                app.audition_held_key = key;
                             }
                         }
                     }
@@ -1436,17 +1704,37 @@ int main(int argc, char** argv) {
             app.begin_browse();
         }
         ImGui::SameLine();
+        if (ImGui::Button(app.modarchive_busy ? "Random…" : "Random") && !app.modarchive_busy) {
+            app.begin_modarchive_random();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Download a random module from modarchive.org");
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Open") && app.open_path[0]) {
             app.request_open_typed();
         }
         ImGui::SameLine();
+        {
+            ImGui::SetNextItemWidth(56);
+            const char* ch_labs[] = {"2ch", "3ch", "4ch", "5ch", "6ch", "7ch", "8ch"};
+            int ch_idx = std::clamp(app.new_channels, 2, 8) - 2;
+            if (ImGui::Combo("##newch", &ch_idx, ch_labs, 7)) {
+                app.new_channels = ch_idx + 2;
+            }
+        }
+        ImGui::SameLine();
         if (ImGui::Button("New")) {
-            SDL_LockAudioDevice(adev);
-            bridge.player = nullptr;
-            bridge.smus = nullptr;
-            SDL_UnlockAudioDevice(adev);
-            app.new_song();
-            apply_loaded_module();
+            if (app.confirm_discard()) {
+                SDL_LockAudioDevice(adev);
+                bridge.player = nullptr;
+                bridge.smus = nullptr;
+                SDL_UnlockAudioDevice(adev);
+                app.new_song(app.new_channels);
+                apply_loaded_module();
+                // Snapshot was taken before New; refresh so channel meters match the new player.
+                snap = app.player->snapshot();
+            }
         }
         if (app.player) {
             ImGui::SameLine();
@@ -1461,6 +1749,35 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Button("Save As…")) {
                 app.begin_save_as();
+            }
+        } else if (app.smus) {
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) {
+                if (app.open_path[0] && std::strstr(app.open_path, "untitled") == nullptr &&
+                    fs::path(app.open_path).extension() == ".smus") {
+                    app.save_smus_to(app.open_path);
+                } else {
+                    app.begin_save_as();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save As…")) {
+                app.begin_save_as();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("→ MOD")) {
+                SDL_LockAudioDevice(adev);
+                bridge.player = nullptr;
+                bridge.smus = nullptr;
+                SDL_UnlockAudioDevice(adev);
+                app.convert_smus_to_mod();
+                apply_loaded_module();
+                if (app.player) {
+                    snap = app.player->snapshot();
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Bake SMUS to editable ProTracker module (lossy)");
             }
         }
 
@@ -1490,15 +1807,46 @@ int main(int argc, char** argv) {
                 app.flash = 0.4f;
             }
             ImGui::SameLine();
-            ImGui::Text("%s   %.1f BPM   %s", ssnap.title.c_str(), ssnap.bpm,
-                        ssnap.finished ? "END" : (ssnap.playing ? "PLAYING" : "PAUSED"));
+            ImGui::Text("%s%s   %.1f BPM   %s", app.smus->dirty() ? "*" : "", ssnap.title.c_str(),
+                        ssnap.bpm, ssnap.finished ? "END" : (ssnap.playing ? "PLAYING" : "PAUSED"));
 
             {
                 const float total = float(std::max(1, ssnap.pattern_rows));
                 ImGui::ProgressBar(float(ssnap.playhead_row) / total, ImVec2(-1, 10), "");
             }
 
-            ImGui::TextDisabled("Space  ·  R restart  ·  O open  ·  H help  ·  P options");
+            ImGui::Checkbox("Edit", &app.smus_edit_mode);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            ImGui::DragInt("Oct", &app.smus_edit_octave, 1, 1, 8);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            ImGui::DragInt("Ins", &app.smus_edit_instr, 1, 0, 127);
+            ImGui::SameLine();
+            {
+                float bpm = ssnap.bpm;
+                ImGui::SetNextItemWidth(70);
+                if (ImGui::DragFloat("BPM", &bpm, 1.f, 32.f, 255.f, "%.0f")) {
+                    app.smus->set_tempo_bpm(bpm);
+                }
+            }
+            ImGui::SameLine();
+            if (!app.midi_in.active()) {
+                if (ImGui::SmallButton("MIDI In")) {
+                    if (app.midi_in.open_default()) {
+                        app.status = "MIDI: " + app.midi_in.device_name();
+                    } else {
+                        app.status = "MIDI: " + app.midi_in.device_name();
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("MIDI: %s", app.midi_in.device_name().c_str());
+                ImGui::SameLine();
+                ImGui::Checkbox("Record", &app.midi_to_pattern);
+            }
+
+            ImGui::TextDisabled(
+                "Click cell to place/clear  ·  Space  ·  R restart  ·  F1–F4 mute  ·  Ctrl+S save");
             ImGui::TextWrapped("%s", app.status.c_str());
 
             const int chn = std::max(1, std::min(4, ssnap.tracks));
@@ -1508,7 +1856,7 @@ int main(int argc, char** argv) {
                     ImGui::PushID(ci);
                     const auto& ch = ssnap.channels[size_t(ci)];
                     ImGui::PushStyleColor(ImGuiCol_Text, ch_color(ci));
-                    ImGui::Text("AUD%d %s", ci, ch.active ? "" : "·");
+                    ImGui::Text("AUD%d %s", ci, ch.muted ? "MUTE" : (ch.active ? "" : "·"));
                     ImGui::PopStyleColor();
                     ImGui::Text("%s", ch.last_note);
                     ImGui::TextDisabled("%02d %s", ch.instrument_reg, ch.instrument_name);
@@ -1516,7 +1864,10 @@ int main(int argc, char** argv) {
                                         ssnap.track_done[size_t(ci)] ? " done" : "");
                     if (app.view.show_vu) {
                         draw_vu("vu", std::min(1.f, ch.peak * 2.4f),
-                                std::min(1.f, ch.peak_hold * 2.4f), false, app.view.meter_height);
+                                std::min(1.f, ch.peak_hold * 2.4f), ch.muted, app.view.meter_height);
+                    }
+                    if (ImGui::SmallButton(ch.muted ? "Unmute" : "Mute")) {
+                        app.smus->toggle_mute(ci);
                     }
                     ImGui::PopID();
                 }
@@ -1558,12 +1909,24 @@ int main(int argc, char** argv) {
                         for (int c = 0; c < chn && c < int(pat.cells[size_t(row)].size()); ++c) {
                             ImGui::TableSetColumnIndex(c + 1);
                             const auto& cell = pat.cells[size_t(row)][size_t(c)];
-                            if (cur) {
-                                ImGui::TextUnformatted(cell.text);
-                            } else if (cell.midi > 0) {
-                                ImGui::TextColored(ch_color(c), "%s", cell.text);
-                            } else {
-                                ImGui::TextDisabled("%s", cell.text);
+                            char label[40];
+                            std::snprintf(label, sizeof(label), "%s##s%d_%d", cell.text, row, c);
+                            if (cell.midi > 0) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, ch_color(c));
+                            }
+                            if (ImGui::Selectable(label, false)) {
+                                if (app.smus_edit_mode) {
+                                    if (cell.midi > 0) {
+                                        app.smus->clear_cell(c, row);
+                                    } else {
+                                        const int midi =
+                                            std::clamp(app.smus_edit_octave * 12, 12, 108);
+                                        app.smus->place_note(c, row, midi, app.smus_edit_instr);
+                                    }
+                                }
+                            }
+                            if (cell.midi > 0) {
+                                ImGui::PopStyleColor();
                             }
                         }
                     }
@@ -1582,9 +1945,82 @@ int main(int argc, char** argv) {
                 first = false;
                 char lab[48];
                 std::snprintf(lab, sizeof(lab), "%02d:%s", reg, name.c_str());
-                ImGui::SmallButton(lab);
+                const bool sel = app.selected_smus_instr == reg;
+                if (sel) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.42f, 0.12f, 1.f));
+                }
+                if (ImGui::SmallButton(lab)) {
+                    app.selected_smus_instr = reg;
+                    const auto& instruments = app.smus->instruments();
+                    auto it = instruments.find(reg);
+                    const char* kind = "synth";
+                    size_t wave_n = 0;
+                    float vol = 1.f;
+                    if (it != instruments.end()) {
+                        switch (it->second.kind) {
+                        case smus::InstrKind::Sample:
+                            kind = "sample";
+                            break;
+                        case smus::InstrKind::S8svx:
+                            kind = "8svx";
+                            break;
+                        default:
+                            kind = "synth";
+                            break;
+                        }
+                        wave_n = it->second.wave.empty() ? it->second.ss_data.size()
+                                                         : it->second.wave.size();
+                        vol = it->second.volume;
+                    }
+                    app.status = "SMUS instr " + std::to_string(reg) + " \"" + name + "\" · " +
+                                 kind + " · " + std::to_string(wave_n) + " samples · vol " +
+                                 std::to_string(int(vol * 100.f)) + "%";
+                }
+                if (sel) {
+                    ImGui::PopStyleColor();
+                }
             }
             ImGui::EndChild();
+            if (app.selected_smus_instr >= 0) {
+                const int reg = app.selected_smus_instr;
+                const auto& instruments = app.smus->instruments();
+                auto it = instruments.find(reg);
+                const auto name_it = app.smus->score().instruments.find(reg);
+                const std::string& name =
+                    name_it != app.smus->score().instruments.end() ? name_it->second : std::string("?");
+                if (it != instruments.end()) {
+                    const auto& inst = it->second;
+                    const char* kind = "Synth";
+                    if (inst.kind == smus::InstrKind::Sample) {
+                        kind = "SampledSound";
+                    } else if (inst.kind == smus::InstrKind::S8svx) {
+                        kind = "8SVX";
+                    }
+                    const size_t wave_n =
+                        inst.wave.empty() ? inst.ss_data.size() : inst.wave.size();
+                    ImGui::TextWrapped(
+                        "Selected %02d \"%s\"  ·  %s  ·  %zu samples  ·  loop %d–%d  ·  "
+                        "base MIDI %d  ·  rate %.0f Hz  ·  vol %.0f%%",
+                        reg, name.c_str(), kind, wave_n, inst.loop_start, inst.loop_end,
+                        inst.base_midi, inst.base_rate, inst.volume * 100.f);
+                    if (inst.kind == smus::InstrKind::Synth) {
+                        ImGui::TextDisabled(
+                            "env L %d/%d/%d/%d  R %d/%d/%d/%d  ·  filter base %d env %d mod %d  ·  "
+                            "LFO %s",
+                            inst.env_levels[0], inst.env_levels[1], inst.env_levels[2],
+                            inst.env_levels[3], inst.env_rates[0], inst.env_rates[1],
+                            inst.env_rates[2], inst.env_rates[3], inst.f_base, inst.f_env,
+                            inst.f_mod, inst.lfo_enable ? "on" : "off");
+                    } else if (inst.kind == smus::InstrKind::Sample) {
+                        ImGui::TextDisabled("oneshot %d  repeat %d  ·  oct %d–%d  ·  vib d/r/delay %d/%d/%d",
+                                            inst.ss_oneshot, inst.ss_repeat, inst.ss_lo, inst.ss_hi,
+                                            inst.vib_depth, inst.vib_rate, inst.vib_delay);
+                    }
+                } else {
+                    ImGui::TextDisabled("Selected %02d \"%s\" — instrument data missing (default used)",
+                                        reg, name.c_str());
+                }
+            }
 
             ImGui::End();
             draw_help_window(app);
@@ -1659,6 +2095,41 @@ int main(int argc, char** argv) {
             ImGui::SetNextItemWidth(50);
             ImGui::DragInt("Step", &ed.step, 1, 0, 16);
             ImGui::SameLine();
+            {
+                int restart = 0;
+                int song_len = 1;
+                int channels = 4;
+                {
+                    std::lock_guard lock(app.player->mutex());
+                    restart = app.player->module().restart;
+                    song_len = std::max(1, app.player->module().song_length);
+                    channels = app.player->module().channels;
+                }
+                ImGui::SetNextItemWidth(50);
+                if (ImGui::DragInt("Rst", &restart, 1, 0, std::max(0, song_len - 1))) {
+                    std::lock_guard lock(app.player->mutex());
+                    app.player->module().restart =
+                        std::clamp(restart, 0, std::max(0, app.player->module().song_length - 1));
+                    ed.mark_dirty();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Restart order position (loop point)");
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(56);
+                const char* ch_labs[] = {"2ch", "3ch", "4ch", "5ch", "6ch", "7ch", "8ch"};
+                int ch_idx = std::clamp(channels, 2, 8) - 2;
+                if (ImGui::Combo("##edch", &ch_idx, ch_labs, 7)) {
+                    app.player->set_channel_count(ch_idx + 2);
+                    ed.ch = std::clamp(ed.ch, 0, ch_idx + 1);
+                    ed.mark_dirty();
+                    snap = app.player->snapshot();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Channel count (remaps pattern cells)");
+                }
+            }
+            ImGui::SameLine();
             if (ImGui::SmallButton("Undo") && ed.undo(app.player->module(), app.player->mutex())) {
             }
             ImGui::SameLine();
@@ -1669,10 +2140,23 @@ int main(int argc, char** argv) {
         ImGui::TextDisabled(
             "F9 Pattern  ·  F10 Sample  ·  Ctrl+N/S  ·  Z/Q piano  ·  Del clear  ·  Ctrl+Z/Y  ·  "
             "Space  ·  H help  ·  P options");
+        if (!app.midi_in.active()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("MIDI In")) {
+                app.midi_in.open_default();
+                app.status = "MIDI: " + app.midi_in.device_name();
+            }
+        } else {
+            ImGui::SameLine();
+            ImGui::TextDisabled("MIDI:%s", app.midi_in.device_name().c_str());
+            ImGui::SameLine();
+            ImGui::Checkbox("MIDI→pat", &app.midi_to_pattern);
+        }
         ImGui::TextWrapped("%s", app.status.c_str());
 
-        const int chn = snap.channels;
-        if (ImGui::BeginTable("chs", std::max(1, chn), ImGuiTableFlags_SizingStretchSame)) {
+        const int chn =
+            std::min(std::max(1, snap.channels), int(snap.channels_state.size()));
+        if (chn > 0 && ImGui::BeginTable("chs", chn, ImGuiTableFlags_SizingStretchSame)) {
             for (int ci = 0; ci < chn; ++ci) {
                 ImGui::TableNextColumn();
                 ImGui::PushID(ci);
@@ -1714,7 +2198,7 @@ int main(int argc, char** argv) {
             ImGui::EndTable();
         }
 
-        if (app.view.show_spectrum) {
+        if (app.view.show_spectrum && chn > 0) {
             std::array<float, mod::kScopeSamples> mix{};
             for (int ci = 0; ci < chn; ++ci) {
                 const auto& ch = snap.channels_state[size_t(ci)];
@@ -1755,6 +2239,49 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::SmallButton("New Pat")) {
                 ed.pat = ed.add_pattern(app.player->module(), app.player->mutex());
+                {
+                    std::lock_guard lock(app.player->mutex());
+                    if (ed.pat >= 0 && ed.pat < app.player->module().pattern_count()) {
+                        pat_view = app.player->module().patterns[size_t(ed.pat)];
+                    }
+                }
+            }
+            ImGui::SameLine();
+            {
+                int rows = pat_view.empty() ? mod::kRows : int(pat_view.size());
+                ImGui::SetNextItemWidth(50);
+                if (ImGui::DragInt("Rows", &rows, 1, 1, 256)) {
+                    ed.set_pattern_length(app.player->module(), app.player->mutex(), ed.pat, rows);
+                    {
+                        std::lock_guard lock(app.player->mutex());
+                        if (ed.pat >= 0 && ed.pat < app.player->module().pattern_count()) {
+                            pat_view = app.player->module().patterns[size_t(ed.pat)];
+                        }
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Pattern length (1–256; .mod save uses 64)");
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+Row")) {
+                ed.insert_rows(app.player->module(), app.player->mutex(), ed.pat, ed.row, 1);
+                {
+                    std::lock_guard lock(app.player->mutex());
+                    if (ed.pat >= 0 && ed.pat < app.player->module().pattern_count()) {
+                        pat_view = app.player->module().patterns[size_t(ed.pat)];
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("-Row")) {
+                ed.delete_rows(app.player->module(), app.player->mutex(), ed.pat, ed.row, 1);
+                {
+                    std::lock_guard lock(app.player->mutex());
+                    if (ed.pat >= 0 && ed.pat < app.player->module().pattern_count()) {
+                        pat_view = app.player->module().patterns[size_t(ed.pat)];
+                    }
+                }
             }
 
             const int pat_rows = pat_view.empty() ? 0 : int(pat_view.size());

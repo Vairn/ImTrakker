@@ -6,6 +6,55 @@
 #include <cstring>
 
 namespace mod {
+namespace {
+
+constexpr int kMinPeriod = 113;
+constexpr int kMaxPeriod = 856;
+
+int clamp_period(int p) {
+    return std::clamp(p, kMinPeriod, kMaxPeriod);
+}
+
+int clamp_vol(int v) {
+    return std::clamp(v, 0, 64);
+}
+
+// Linear-interpolated sample read with optional Amiga-style loop.
+float fetch_sample(const std::vector<float>& data, int length, double pos, bool looping,
+                   double rep_start, double rep_len, double loop_end) {
+    if (length < 2) {
+        return 0.f;
+    }
+    if (looping) {
+        if (pos >= loop_end) {
+            pos = rep_start + std::fmod(std::max(0.0, pos - rep_start), rep_len);
+        }
+        if (pos < 0.0) {
+            pos = 0.0;
+        }
+        int i0 = int(pos);
+        const double frac = pos - double(i0);
+        int i1 = i0 + 1;
+        if (i0 >= length) {
+            return 0.f;
+        }
+        if (double(i1) >= loop_end) {
+            i1 = int(rep_start);
+        }
+        i0 = std::clamp(i0, 0, length - 1);
+        i1 = std::clamp(i1, 0, length - 1);
+        return data[size_t(i0)] * float(1.0 - frac) + data[size_t(i1)] * float(frac);
+    }
+    if (pos < 0.0 || pos >= double(length)) {
+        return 0.f;
+    }
+    const int i0 = int(pos);
+    const double frac = pos - double(i0);
+    const int i1 = std::min(i0 + 1, length - 1);
+    return data[size_t(i0)] * float(1.0 - frac) + data[size_t(i1)] * float(frac);
+}
+
+}  // namespace
 
 Player::Player(Module module) {
     load(std::move(module));
@@ -21,6 +70,11 @@ void Player::load(Module module) {
     tempo_ = std::max(32, module_.initial_tempo);
     pattern_break_ = -1;
     pattern_jump_ = -1;
+    pattern_delay_ = 0;
+    pattern_loop_ = false;
+    pattern_loop_to_ = 0;
+    filter_on_ = true;
+    filter_l_ = filter_r_ = 0.f;
     channels_.assign(size_t(std::max(1, module_.channels)), ChannelState{});
     playing_ = true;
     finished_ = false;
@@ -35,12 +89,15 @@ void Player::restart() {
     tick_ = 0;
     pattern_break_ = -1;
     pattern_jump_ = -1;
+    pattern_delay_ = 0;
+    pattern_loop_ = false;
+    pattern_loop_to_ = 0;
     tick_left_ = 0;
+    filter_l_ = filter_r_ = 0.f;
     for (auto& ch : channels_) {
-        ch.sample = nullptr;
-        ch.sample_pos = 0.0;
-        ch.volume = 0;
-        ch.period = 0;
+        const bool muted = ch.muted;
+        ch = ChannelState{};
+        ch.muted = muted;
     }
     playing_ = true;
     finished_ = false;
@@ -57,8 +114,14 @@ void Player::seek_order(int delta) {
     tick_ = 0;
     pattern_break_ = -1;
     pattern_jump_ = -1;
+    pattern_delay_ = 0;
+    pattern_loop_ = false;
     tick_left_ = 0;
     row_event_ = true;
+    for (auto& ch : channels_) {
+        ch.loop_count = 0;
+        ch.loop_row = 0;
+    }
 }
 
 void Player::seek_row(int order, int row) {
@@ -74,6 +137,8 @@ void Player::seek_row(int order, int row) {
     tick_ = 0;
     pattern_break_ = -1;
     pattern_jump_ = -1;
+    pattern_delay_ = 0;
+    pattern_loop_ = false;
     tick_left_ = 0;
     row_event_ = true;
 }
@@ -111,6 +176,29 @@ void Player::unmute_all() {
     }
 }
 
+void Player::set_channel_count(int channels) {
+    std::lock_guard lock(mutex_);
+    channels = std::clamp(channels, 2, 8);
+    if (channels == module_.channels) {
+        module_.magic = magic_for_channels(channels);
+        return;
+    }
+    for (auto& pat : module_.patterns) {
+        for (auto& row : pat) {
+            row.resize(size_t(channels));
+        }
+    }
+    module_.channels = channels;
+    module_.magic = magic_for_channels(channels);
+
+    std::vector<ChannelState> next;
+    next.resize(size_t(channels));
+    for (size_t i = 0; i < next.size() && i < channels_.size(); ++i) {
+        next[i] = channels_[i];
+    }
+    channels_ = std::move(next);
+}
+
 int Player::samples_per_tick() const {
     return std::max(1, int(std::lround(kSampleRate * 2.5 / double(tempo_))));
 }
@@ -122,78 +210,538 @@ int Player::pattern_index_unlocked() const {
     return module_.orders[size_t(order_pos_)];
 }
 
-void Player::trigger(ChannelState& ch, const Note& note) {
+int Player::vib_wave(ChannelState& /*ch*/, int pos, int wave) const {
+    const int p = (pos >> 2) & 0x1F;
+    switch (wave & 3) {
+        case 0:  // sine
+            return kVibTable[size_t(p)];
+        case 1:  // ramp down
+            return (pos & 0x80) ? (255 - (p << 3)) : (p << 3);
+        case 2:  // square
+        case 3:
+            return 255;
+        default:
+            return kVibTable[size_t(p)];
+    }
+}
+
+void Player::do_tone_porta(ChannelState& ch) {
+    if (!ch.wanted_period || !ch.porta_speed) {
+        ch.out_period = ch.glissando ? period_for_note(nearest_period_index_ft(ch.period, ch.finetune), ch.finetune)
+                                     : ch.period;
+        return;
+    }
+    if (ch.tone_porta_dir) {
+        ch.period -= ch.porta_speed;
+        if (ch.period <= ch.wanted_period) {
+            ch.period = ch.wanted_period;
+            ch.wanted_period = 0;
+        }
+    } else {
+        ch.period += ch.porta_speed;
+        if (ch.period >= ch.wanted_period) {
+            ch.period = ch.wanted_period;
+            ch.wanted_period = 0;
+        }
+    }
+    if (ch.glissando) {
+        ch.out_period = period_for_note(nearest_period_index_ft(ch.period, ch.finetune), ch.finetune);
+    } else {
+        ch.out_period = ch.period;
+    }
+}
+
+void Player::do_vibrato(ChannelState& ch) {
+    const int wave = ch.wave_control & 3;
+    int delta = vib_wave(ch, ch.vib_pos, wave);
+    delta = (delta * ch.vib_depth) >> 7;
+    if (ch.vib_pos & 0x80) {
+        ch.out_period = ch.period - delta;
+    } else {
+        ch.out_period = ch.period + delta;
+    }
+    ch.vib_pos = (ch.vib_pos + (ch.vib_speed << 2)) & 0xFF;
+}
+
+void Player::do_tremolo(ChannelState& ch) {
+    const int wave = (ch.wave_control >> 4) & 3;
+    int delta = vib_wave(ch, ch.trem_pos, wave);
+    delta = (delta * ch.trem_depth) >> 6;
+    int vol = ch.volume;
+    if (ch.trem_pos & 0x80) {
+        vol -= delta;
+    } else {
+        vol += delta;
+    }
+    ch.out_volume = clamp_vol(vol);
+    ch.trem_pos = (ch.trem_pos + (ch.trem_speed << 2)) & 0xFF;
+}
+
+void Player::do_vol_slide(ChannelState& ch, int param) {
+    const int up = (param >> 4) & 0x0F;
+    const int down = param & 0x0F;
+    if (up) {
+        ch.volume = clamp_vol(ch.volume + up);
+    } else {
+        ch.volume = clamp_vol(ch.volume - down);
+    }
+    ch.out_volume = ch.volume;
+}
+
+void Player::do_arpeggio(ChannelState& ch) {
+    const int step = tick_ % 3;
+    const int p = ch.param;
+    const int base_idx = nearest_period_index_ft(ch.period, ch.finetune);
+    if (step == 0) {
+        ch.out_period = ch.period;
+    } else {
+        const int semi = (step == 1) ? ((p >> 4) & 0x0F) : (p & 0x0F);
+        const int nidx = std::min(35, base_idx + semi);
+        ch.out_period = period_for_note(nidx, ch.finetune);
+    }
+}
+
+void Player::do_retrig(ChannelState& ch) {
+    if (!ch.sample) {
+        return;
+    }
+    ch.sample_pos = 0.0;
+}
+
+void Player::update_funk(ChannelState& ch) {
+    if (!ch.funk_speed || !ch.sample) {
+        return;
+    }
+    ch.funk_offset += kFunkTable[size_t(ch.funk_speed & 0x0F)];
+    if (!(ch.funk_offset & 0x80)) {
+        return;
+    }
+    ch.funk_offset = 0;
+    Sample* samp = const_cast<Sample*>(ch.sample);
+    const int length = int(samp->wave.size());
+    if (length <= 0) {
+        return;
+    }
+    const int rep_start = samp->repstart_words * 2;
+    const int rep_len = samp->replen_words * 2;
+    if (rep_len <= 2) {
+        return;
+    }
+    const int loop_end = rep_start + rep_len;
+    ++ch.funk_pos;
+    if (ch.funk_pos < rep_start || ch.funk_pos >= loop_end) {
+        ch.funk_pos = rep_start;
+    }
+    if (ch.funk_pos >= 0 && ch.funk_pos < length) {
+        // Approximate Amiga `not.b` on signed 8-bit PCM stored as float.
+        samp->wave[size_t(ch.funk_pos)] = -samp->wave[size_t(ch.funk_pos)];
+    }
+}
+
+void Player::trigger(ChannelState& ch, const Note& note, bool force_retrig) {
+    const int fx = note.effect;
+    const int p = note.param;
+    const bool is_porta = (fx == 0x3 || fx == 0x5);
+    const bool is_delay = (fx == 0xE && ((p >> 4) & 0x0F) == 0xD && (p & 0x0F) != 0);
+
+    if (is_delay && !force_retrig) {
+        ch.delay_note = true;
+        ch.delayed = note;
+        // Still remember instrument / effect for display; note starts later.
+        ch.effect = fx;
+        ch.param = p;
+        if (fx || p) {
+            std::snprintf(ch.last_fx, sizeof(ch.last_fx), "%X%02X", fx, p);
+        }
+        return;
+    }
+    ch.delay_note = false;
+
     if (note.instrument) {
         const int ins = note.instrument;
         if (ins >= 1 && ins <= int(module_.samples.size())) {
             ch.instrument = ins;
             ch.sample = &module_.samples[size_t(ins - 1)];
-            ch.volume = ch.sample->volume;
-            ch.sample_pos = 0.0;
+            ch.volume = clamp_vol(ch.sample->volume);
+            ch.out_volume = ch.volume;
+            ch.finetune = ch.sample->finetune;
+            ch.funk_pos = ch.sample->repstart_words * 2;
         }
     }
+
     if (note.period) {
-        ch.period = note.period;
-        ch.arp_period = note.period;
+        const int note_idx = nearest_period_index(note.period);
+        const int tuned = period_for_note(note_idx, ch.finetune);
         ch.last_note = period_to_note(note.period);
-        if (note.effect != 0x3) {
+
+        if (is_porta) {
+            ch.wanted_period = tuned;
+            if (ch.wanted_period == ch.period) {
+                ch.wanted_period = 0;
+            } else {
+                ch.tone_porta_dir = (ch.wanted_period < ch.period) ? 1 : 0;
+            }
+        } else {
+            ch.period = tuned;
+            ch.out_period = tuned;
             ch.sample_pos = 0.0;
+            if (!(ch.wave_control & 4)) {
+                ch.vib_pos = 0;
+            }
+            if (!(ch.wave_control & 0x40)) {
+                ch.trem_pos = 0;
+            }
             if (ch.instrument && !ch.sample) {
                 ch.sample = &module_.samples[size_t(ch.instrument - 1)];
             }
         }
     }
-    ch.effect = note.effect;
-    ch.param = note.param;
-    if (note.effect || note.param) {
-        std::snprintf(ch.last_fx, sizeof(ch.last_fx), "%X%02X", note.effect, note.param);
+
+    if (force_retrig && note.period && !is_porta) {
+        ch.sample_pos = 0.0;
+    }
+
+    ch.effect = fx;
+    ch.param = p;
+    if (fx || p) {
+        std::snprintf(ch.last_fx, sizeof(ch.last_fx), "%X%02X", fx, p);
     } else {
         std::memcpy(ch.last_fx, "...", 4);
     }
 
+    apply_row_fx(ch, note);
+}
+
+void Player::apply_row_fx(ChannelState& ch, const Note& note) {
     const int fx = note.effect;
     const int p = note.param;
-    if (fx == 0xC) {
-        ch.volume = std::min(64, p);
-    } else if (fx == 0xF) {
-        if (p == 0) {
-        } else if (p < 32) {
-            speed_ = p;
-        } else {
-            tempo_ = p;
+    const int ex = (p >> 4) & 0x0F;
+    const int ey = p & 0x0F;
+
+    ch.out_period = ch.period;
+    ch.out_volume = ch.volume;
+
+    switch (fx) {
+        case 0x3:
+            if (p) {
+                ch.porta_speed = p;
+            }
+            break;
+        case 0x4:
+            if (ex) {
+                ch.vib_speed = ex;
+            }
+            if (ey) {
+                ch.vib_depth = ey;
+            }
+            do_vibrato(ch);
+            break;
+        case 0x5:
+            // tone porta + vol slide: porta uses prior speed; vol slide on ticks > 0
+            break;
+        case 0x6:
+            do_vibrato(ch);
+            break;
+        case 0x7:
+            if (ex) {
+                ch.trem_speed = ex;
+            }
+            if (ey) {
+                ch.trem_depth = ey;
+            }
+            do_tremolo(ch);
+            break;
+        case 0x9: {
+            if (p) {
+                ch.sample_offset = p;
+            }
+            if (ch.sample) {
+                const double off = double(ch.sample_offset) * 256.0;
+                if (off >= double(ch.sample->wave.size())) {
+                    // PT quirk: offset past end → silence
+                    ch.sample_pos = double(ch.sample->wave.size());
+                } else {
+                    ch.sample_pos = off;
+                }
+            }
+            break;
         }
-    } else if (fx == 0xD) {
-        pattern_break_ = (p >> 4) * 10 + (p & 0x0F);
-    } else if (fx == 0xB) {
-        pattern_jump_ = p;
-    } else if (fx == 0x1 || fx == 0x2) {
-        ch.porta_speed = p;
+        case 0xB:
+            pattern_jump_ = p;
+            break;
+        case 0xC:
+            ch.volume = clamp_vol(p);
+            ch.out_volume = ch.volume;
+            break;
+        case 0xD:
+            pattern_break_ = ex * 10 + ey;
+            break;
+        case 0xE:
+            switch (ex) {
+                case 0x0:  // filter
+                    filter_on_ = (ey & 1) == 0;
+                    break;
+                case 0x1:  // fine porta up
+                    ch.period = clamp_period(ch.period - ey);
+                    ch.out_period = ch.period;
+                    break;
+                case 0x2:  // fine porta down
+                    ch.period = clamp_period(ch.period + ey);
+                    ch.out_period = ch.period;
+                    break;
+                case 0x3:  // glissando
+                    ch.glissando = ey != 0;
+                    break;
+                case 0x4:  // vibrato waveform
+                    ch.wave_control = (ch.wave_control & 0xF0) | (ey & 0x0F);
+                    break;
+                case 0x5:  // set finetune
+                    ch.finetune = (ey >= 8) ? ey - 16 : ey;
+                    if (note.period) {
+                        const int idx = nearest_period_index(note.period);
+                        ch.period = period_for_note(idx, ch.finetune);
+                        ch.out_period = ch.period;
+                    }
+                    break;
+                case 0x6:  // pattern loop
+                    if (ey == 0) {
+                        ch.loop_row = row_;
+                    } else if (ch.loop_count == 0) {
+                        ch.loop_count = ey;
+                        pattern_loop_ = true;
+                        pattern_loop_to_ = ch.loop_row;
+                    } else {
+                        --ch.loop_count;
+                        if (ch.loop_count != 0) {
+                            pattern_loop_ = true;
+                            pattern_loop_to_ = ch.loop_row;
+                        }
+                    }
+                    break;
+                case 0x7:  // tremolo waveform
+                    ch.wave_control = (ch.wave_control & 0x0F) | ((ey & 0x0F) << 4);
+                    break;
+                case 0x9:  // retrig — handled on later ticks; also on tick0 if no note
+                    if (ey && tick_ == 0 && !note.period) {
+                        do_retrig(ch);
+                    }
+                    break;
+                case 0xA:  // fine vol up
+                    ch.volume = clamp_vol(ch.volume + ey);
+                    ch.out_volume = ch.volume;
+                    break;
+                case 0xB:  // fine vol down
+                    ch.volume = clamp_vol(ch.volume - ey);
+                    ch.out_volume = ch.volume;
+                    break;
+                case 0xC:  // note cut
+                    if (ey == 0) {
+                        ch.volume = 0;
+                        ch.out_volume = 0;
+                    }
+                    break;
+                case 0xD:  // note delay — trigger already deferred
+                    break;
+                case 0xE:  // pattern delay
+                    if (pattern_delay_ == 0) {
+                        pattern_delay_ = ey;
+                    }
+                    break;
+                case 0xF:  // invert loop speed
+                    ch.funk_speed = ey;
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case 0xF:
+            if (p == 0) {
+                // F00: stop (ProTracker quirk varies; treat as stop)
+                playing_ = false;
+                finished_ = true;
+            } else if (p < 32) {
+                speed_ = p;
+            } else {
+                tempo_ = p;
+            }
+            break;
+        default:
+            break;
     }
 }
 
 void Player::tick_fx(ChannelState& ch) {
+    update_funk(ch);
+
     const int fx = ch.effect;
     const int p = ch.param;
-    if (fx == 0x0 && p) {
-        const int step = tick_ % 3;
-        const int base = ch.arp_period ? ch.arp_period : ch.period;
-        if (step == 0) {
-            ch.period = base;
-        } else {
-            const int idx = nearest_period_index(base);
-            const int semi = (step == 1) ? (p >> 4) : (p & 0x0F);
-            const int nidx = std::min(int(kPeriodTable.size()) - 1, idx + semi);
-            ch.period = kPeriodTable[size_t(nidx)];
-        }
-    } else if (fx == 0x1) {
-        const int speed = p ? p : ch.porta_speed;
-        ch.period = std::max(113, ch.period - speed);
-        ch.arp_period = ch.period;
-    } else if (fx == 0x2) {
-        const int speed = p ? p : ch.porta_speed;
-        ch.period = std::min(856, ch.period + speed);
-        ch.arp_period = ch.period;
+    const int ex = (p >> 4) & 0x0F;
+    const int ey = p & 0x0F;
+
+    ch.out_period = ch.period;
+    ch.out_volume = ch.volume;
+
+    // Delayed note trigger (EDx)
+    if (ch.delay_note && fx == 0xE && ex == 0xD && tick_ == ey) {
+        const Note n = ch.delayed;
+        ch.delay_note = false;
+        // Clear delay so trigger plays immediately
+        Note play = n;
+        play.effect = 0;
+        play.param = 0;
+        trigger(ch, play, true);
+        ch.effect = n.effect;
+        ch.param = n.param;
+        return;
     }
+
+    switch (fx) {
+        case 0x0:
+            if (p) {
+                do_arpeggio(ch);
+            }
+            break;
+        case 0x1:
+            if (tick_ > 0) {
+                ch.period = clamp_period(ch.period - p);
+                ch.out_period = ch.period;
+            }
+            break;
+        case 0x2:
+            if (tick_ > 0) {
+                ch.period = clamp_period(ch.period + p);
+                ch.out_period = ch.period;
+            }
+            break;
+        case 0x3:
+            if (p) {
+                ch.porta_speed = p;
+            }
+            if (tick_ > 0) {
+                do_tone_porta(ch);
+            }
+            break;
+        case 0x4:
+            if (ex) {
+                ch.vib_speed = ex;
+            }
+            if (ey) {
+                ch.vib_depth = ey;
+            }
+            do_vibrato(ch);
+            break;
+        case 0x5:
+            if (tick_ > 0) {
+                do_tone_porta(ch);
+                do_vol_slide(ch, p);
+            }
+            break;
+        case 0x6:
+            do_vibrato(ch);
+            if (tick_ > 0) {
+                do_vol_slide(ch, p);
+            }
+            break;
+        case 0x7:
+            if (ex) {
+                ch.trem_speed = ex;
+            }
+            if (ey) {
+                ch.trem_depth = ey;
+            }
+            do_tremolo(ch);
+            break;
+        case 0xA:
+            if (tick_ > 0) {
+                do_vol_slide(ch, p);
+            }
+            break;
+        case 0xE:
+            switch (ex) {
+                case 0x9:  // retrig
+                    if (ey && (tick_ % ey) == 0) {
+                        do_retrig(ch);
+                    }
+                    break;
+                case 0xC:  // note cut
+                    if (tick_ == ey) {
+                        ch.volume = 0;
+                        ch.out_volume = 0;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void Player::advance_row() {
+    // Pattern loop (E6) takes priority over normal advance; Bxx/Dxx still win if set.
+    if (pattern_loop_ && pattern_jump_ < 0 && pattern_break_ < 0) {
+        row_ = std::max(0, pattern_loop_to_);
+        pattern_loop_ = false;
+        return;
+    }
+    pattern_loop_ = false;
+
+    // Pattern delay: re-play same row (re-triggers notes, like PT).
+    if (pattern_delay_ > 0) {
+        --pattern_delay_;
+        return;
+    }
+
+    if (pattern_jump_ >= 0) {
+        order_pos_ = pattern_jump_ % std::max(1, module_.song_length);
+        // Bxx + Dxx on same row: jump to position, then start at break row.
+        if (pattern_break_ >= 0) {
+            const int pat = module_.orders[size_t(order_pos_)];
+            const int pat_rows =
+                (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size())
+                                                            : kRows;
+            row_ = std::min(std::max(0, pat_rows - 1), pattern_break_);
+        } else {
+            row_ = 0;
+        }
+        for (auto& ch : channels_) {
+            ch.loop_count = 0;
+            ch.loop_row = 0;
+        }
+    } else if (pattern_break_ >= 0) {
+        ++order_pos_;
+        if (order_pos_ >= module_.song_length) {
+            order_pos_ = module_.restart;
+        }
+        const int pat = (order_pos_ < module_.song_length) ? module_.orders[size_t(order_pos_)] : -1;
+        const int pat_rows =
+            (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size())
+                                                        : kRows;
+        row_ = std::min(std::max(0, pat_rows - 1), pattern_break_);
+        for (auto& ch : channels_) {
+            ch.loop_count = 0;
+            ch.loop_row = 0;
+        }
+    } else {
+        const int pat = pattern_index_unlocked();
+        const int pat_rows =
+            (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size()) : 0;
+        ++row_;
+        if (row_ >= pat_rows) {
+            row_ = 0;
+            ++order_pos_;
+            if (order_pos_ >= module_.song_length) {
+                order_pos_ = module_.restart;
+            }
+            for (auto& ch : channels_) {
+                ch.loop_count = 0;
+                ch.loop_row = 0;
+            }
+        }
+    }
+    pattern_break_ = -1;
+    pattern_jump_ = -1;
 }
 
 void Player::process_tick() {
@@ -214,6 +762,7 @@ void Player::process_tick() {
     const int pat = module_.orders[size_t(order_pos_)];
     const int pat_rows =
         (pat >= 0 && pat < module_.pattern_count()) ? int(module_.patterns[size_t(pat)].size()) : 0;
+
     if (tick_ == 0) {
         if (pat < 0 || pat >= module_.pattern_count() || pat_rows <= 0 || row_ >= pat_rows) {
             return;
@@ -221,8 +770,18 @@ void Player::process_tick() {
         const auto& row_notes = module_.patterns[size_t(pat)][size_t(row_)];
         pattern_break_ = -1;
         pattern_jump_ = -1;
+        pattern_loop_ = false;
         for (size_t i = 0; i < channels_.size() && i < row_notes.size(); ++i) {
-            trigger(channels_[i], row_notes[i]);
+            auto& ch = channels_[i];
+            update_funk(ch);
+            trigger(ch, row_notes[i], false);
+            // Tick-0 arpeggio / porta-up etc. handled inside trigger / apply_row_fx.
+            // Also run tick-0 note-cut EC0 already done; arpeggio on tick 0:
+            if (ch.effect == 0x0 && ch.param) {
+                do_arpeggio(ch);
+            } else if (ch.effect == 0x1 || ch.effect == 0x2) {
+                ch.out_period = ch.period;
+            }
         }
         row_event_ = true;
     } else {
@@ -234,25 +793,7 @@ void Player::process_tick() {
     ++tick_;
     if (tick_ >= speed_) {
         tick_ = 0;
-        if (pattern_jump_ >= 0) {
-            order_pos_ = pattern_jump_ % module_.song_length;
-            row_ = 0;
-        } else if (pattern_break_ >= 0) {
-            ++order_pos_;
-            if (order_pos_ >= module_.song_length) {
-                order_pos_ = module_.restart;
-            }
-            row_ = std::min(std::max(0, pat_rows - 1), pattern_break_);
-        } else {
-            ++row_;
-            if (row_ >= pat_rows) {
-                row_ = 0;
-                ++order_pos_;
-                if (order_pos_ >= module_.song_length) {
-                    order_pos_ = module_.restart;
-                }
-            }
-        }
+        advance_row();
     }
 }
 
@@ -269,7 +810,10 @@ void Player::mix(float* left, float* right, int n) {
         float pl = pans8[ci % 8][0];
         float pr = pans8[ci % 8][1];
 
-        if (ch.muted || !ch.sample || ch.period <= 0 || ch.volume <= 0) {
+        const int use_period = ch.out_period > 0 ? ch.out_period : ch.period;
+        const int use_vol = ch.out_volume;
+
+        if (ch.muted || !ch.sample || use_period <= 0 || use_vol <= 0) {
             ch.peak *= 0.85f;
             ch.peak_hold_age += dt;
             if (ch.peak_hold_age > 0.7f) {
@@ -288,8 +832,8 @@ void Player::mix(float* left, float* right, int n) {
             continue;
         }
 
-        const double step = (kPaulaClock / double(ch.period)) / double(kSampleRate);
-        const float vol = ch.volume / 64.f;
+        const double step = (kPaulaClock / double(use_period)) / double(kSampleRate);
+        const float vol = use_vol / 64.f;
         const double rep_start = double(samp.repstart_words * 2);
         const double rep_len = double(samp.replen_words * 2);
         const bool looping = rep_len > 2.0;
@@ -298,18 +842,8 @@ void Player::mix(float* left, float* right, int n) {
         float peak = 0.f;
         double pos = ch.sample_pos;
         for (int i = 0; i < n; ++i) {
-            float v = 0.f;
-            if (looping) {
-                if (pos >= loop_end) {
-                    pos = rep_start + std::fmod(pos - rep_start, rep_len);
-                }
-                const int idx = int(pos);
-                if (idx >= 0 && idx < length) {
-                    v = data[size_t(idx)] * vol;
-                }
-            } else if (pos < length) {
-                v = data[size_t(int(pos))] * vol;
-            }
+            const float v =
+                fetch_sample(data, length, pos, looping, rep_start, rep_len, loop_end) * vol;
             left[i] += v * pl;
             right[i] += v * pr;
             peak = std::max(peak, std::fabs(v));
@@ -335,32 +869,27 @@ void Player::mix(float* left, float* right, int n) {
             }
         }
 
-        // Scope downsample from this block's contribution is approximate: reuse peaks path
-        // by sampling the channel's current position region.
         for (int s = 0; s < kScopeSamples; ++s) {
             const double t = ch.sample_pos - step * (kScopeSamples - s);
-            double tp = t;
-            float v = 0.f;
-            if (looping && length > 0) {
-                if (tp >= loop_end) {
-                    tp = rep_start + std::fmod(std::max(0.0, tp - rep_start), rep_len);
-                }
-                if (tp < 0) {
-                    tp = 0;
-                }
-                const int idx = std::clamp(int(tp), 0, length - 1);
-                v = data[size_t(idx)] * vol;
-            } else if (tp >= 0 && tp < length) {
-                v = data[size_t(int(tp))] * vol;
-            }
-            ch.scope[size_t(s)] = v;
+            ch.scope[size_t(s)] =
+                fetch_sample(data, length, t, looping, rep_start, rep_len, loop_end) * vol;
         }
     }
 
     const float gain = 0.35f * (4.f / float(std::max(4, int(channels_.size()))));
+    // Amiga LED filter ≈ one-pole LPF ~3.3 kHz when on (default).
+    constexpr float kFilterA = 0.37f;
     for (int i = 0; i < n; ++i) {
-        left[i] *= gain;
-        right[i] *= gain;
+        float l = left[i] * gain;
+        float r = right[i] * gain;
+        if (filter_on_) {
+            filter_l_ += (l - filter_l_) * kFilterA;
+            filter_r_ += (r - filter_r_) * kFilterA;
+            l = filter_l_;
+            r = filter_r_;
+        }
+        left[i] = l;
+        right[i] = r;
     }
 }
 
@@ -384,18 +913,9 @@ void Player::mix_audition(float* left, float* right, int n) {
     double pos = audition_pos_;
     bool alive = false;
     for (int i = 0; i < n; ++i) {
-        float v = 0.f;
-        if (looping) {
-            if (pos >= loop_end) {
-                pos = rep_start + std::fmod(pos - rep_start, rep_len);
-            }
-            const int idx = int(pos);
-            if (idx >= 0 && idx < length) {
-                v = data[size_t(idx)] * vol;
-                alive = true;
-            }
-        } else if (pos < length) {
-            v = data[size_t(int(pos))] * vol;
+        const float v =
+            fetch_sample(data, length, pos, looping, rep_start, rep_len, loop_end) * vol;
+        if (looping || pos < length) {
             alive = true;
         }
         left[i] += v;

@@ -95,6 +95,10 @@ struct EditorState {
     void set_order_pattern(Module& m, std::mutex& mutex, int at, int pat_index);
     int add_pattern(Module& m, std::mutex& mutex);
 
+    void set_pattern_length(Module& m, std::mutex& mutex, int pat_index, int rows);
+    void insert_rows(Module& m, std::mutex& mutex, int pat_index, int at, int count = 1);
+    void delete_rows(Module& m, std::mutex& mutex, int pat_index, int at, int count = 1);
+
     void replace_sample(Module& m, std::mutex& mutex, int slot, Sample next);
     Sample& current_sample(Module& m);
     void with_sample_edit(Module& m, std::mutex& mutex, const char* label,

@@ -30,6 +30,94 @@ std::vector<float> pcm_from_bytes(const uint8_t* p, size_t nbytes) {
     return out;
 }
 
+// OctaMED SynthInstr: extract waveform tables / hybrid sample into PCM.
+std::vector<float> bake_mmd_synth(const uint8_t* base, size_t avail, int16_t type) {
+    // Header already consumed: length@0 type@4 — caller passes instrument start.
+    if (avail < 278) {
+        std::vector<float> w(128);
+        for (size_t i = 0; i < w.size(); ++i) {
+            w[i] = (i & 16) ? 0.25f : -0.25f;
+        }
+        return w;
+    }
+    const uint16_t wforms = be16(base + 20);
+    const int nforms = std::clamp(int(wforms), 0, 64);
+
+    auto load_wf = [&](int idx) -> std::vector<float> {
+        if (idx < 0 || idx >= nforms) {
+            return {};
+        }
+        const size_t ptr_off = 278 + size_t(idx) * 4;
+        if (ptr_off + 4 > avail) {
+            return {};
+        }
+        const uint32_t rel = be32(base + ptr_off);
+        if (!rel || rel + 2 > avail) {
+            return {};
+        }
+        const uint16_t words = be16(base + rel);
+        size_t nbytes = size_t(words) * 2;
+        if (rel + 2 + nbytes > avail) {
+            nbytes = (avail > rel + 2) ? (avail - (rel + 2)) : 0;
+        }
+        if (nbytes < 2) {
+            return {};
+        }
+        // Hybrid wf[0] may be a nested sample InstrHdr (length+type) rather than SynthWF.
+        if (type == -2 && idx == 0 && nbytes >= 6) {
+            const uint32_t nested_len = be32(base + rel);
+            const int16_t nested_type = int16_t(be16(base + rel + 4));
+            if (nested_type >= 0 && nested_len > 0 && nested_len < 0x100000 &&
+                rel + 6 + nested_len <= avail) {
+                return pcm_from_bytes(base + rel + 6, nested_len);
+            }
+        }
+        return pcm_from_bytes(base + rel + 2, nbytes);
+    };
+
+    // Prefer first non-empty waveform; for hybrid prefer wf[0] sample then synth waves.
+    if (type == -2) {
+        auto hybrid = load_wf(0);
+        if (hybrid.size() > 2) {
+            return hybrid;
+        }
+    }
+
+    // Walk wftbl for first waveform select command ($00–$3F = waveform number).
+    // wftbl at offset 150, 128 bytes.
+    int pick = -1;
+    for (int i = 0; i < 128; ++i) {
+        const uint8_t cmd = base[150 + i];
+        if (cmd < 0x40) {
+            pick = cmd;
+            break;
+        }
+        if (cmd == 0xFF || cmd == 0xFE) {  // END / JMP-ish stop
+            break;
+        }
+    }
+    if (pick >= 0) {
+        auto w = load_wf(pick);
+        if (w.size() > 2) {
+            return w;
+        }
+    }
+    for (int i = (type == -2 ? 1 : 0); i < nforms; ++i) {
+        auto w = load_wf(i);
+        if (w.size() > 2) {
+            return w;
+        }
+    }
+
+    // Fall back: soft pulse derived from voltbl average levels
+    std::vector<float> w(128);
+    for (size_t i = 0; i < w.size(); ++i) {
+        const float lvl = float(base[22 + (i % 128)] & 0x7F) / 127.f;
+        w[i] = ((i & 16) ? lvl : -lvl) * 0.35f;
+    }
+    return w;
+}
+
 }  // namespace
 
 Module load_mmd(std::vector<uint8_t> data, std::filesystem::path path) {
@@ -123,13 +211,16 @@ Module load_mmd(std::vector<uint8_t> data, std::filesystem::path path) {
                     smp.replen_words = 0;
                 }
             } else {
-                // synth/hybrid — generate a short tone so notes still speak
-                smp.wave.assign(256, 0.f);
-                for (size_t n = 0; n < smp.wave.size(); ++n) {
-                    smp.wave[n] = (n & 32) ? 0.25f : -0.25f;
-                }
+                // Synth (−1) / hybrid (−2): parse SynthInstr and bake a usable PCM loop.
+                smp.wave = bake_mmd_synth(data.data() + off, data.size() - off, type);
                 smp.length_words = int(smp.wave.size() / 2);
-                smp.replen_words = smp.length_words;
+                if (smp.replen_words <= 1) {
+                    smp.repstart_words = 0;
+                    smp.replen_words = std::max(1, smp.length_words);
+                }
+                if (smp.name.find("smp") == 0) {
+                    smp.name = (type == -2) ? "hybrid" : "synth";
+                }
             }
         }
     }

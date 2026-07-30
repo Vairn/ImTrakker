@@ -30,8 +30,11 @@ set(IMGUI_DIR ${imgui_SOURCE_DIR})
 add_executable(imtrakker
     src/main.cpp
     src/hsq.cpp
+    src/midi.cpp
     src/mod/module.cpp
     src/mod/load_mmd.cpp
+    src/mod/load_sfx.cpp
+    src/mod/load_extended.cpp
     src/mod/player.cpp
     src/mod/save_mod.cpp
     src/mod/editor.cpp
@@ -39,6 +42,9 @@ add_executable(imtrakker
     src/mod/sample_edit.cpp
     src/smus/smus_load.cpp
     src/smus/smus_engine.cpp
+    src/smus/smus_save.cpp
+    src/smus/smus_convert.cpp
+    src/modarchive.cpp
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
@@ -61,7 +67,7 @@ target_link_libraries(imtrakker PRIVATE
 
 if(WIN32)
     # portable-file-dialogs (IFileDialog / GetOpenFileName)
-    target_link_libraries(imtrakker PRIVATE comdlg32 ole32 uuid shell32)
+    target_link_libraries(imtrakker PRIVATE comdlg32 ole32 uuid shell32 winmm winhttp)
 
     # Emit SDL2*.dll into the same config folder as imtrakker.exe (Debug/Release/…).
     # Avoids a post-build copy race where F5 launches before the DLL lands beside the exe
